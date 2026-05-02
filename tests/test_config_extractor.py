@@ -292,12 +292,27 @@ INDEX_HTML = """\
   <script>
     fetch("/api/settings.json");
   </script>
+  <a href="/deep">Deep page</a>
+  <button id="load" type="button"
+    onclick="fetch('/api/click-only.json')">Load extra config</button>
 </body>
+</html>
+"""
+
+DEEP_HTML = """\
+<html>
+<head>
+  <script type="application/json">
+    {"deep_url": "https://deep-page.example.com/api"}
+  </script>
+</head>
+<body>deep</body>
 </html>
 """
 
 CONFIG_JSON = json.dumps({"endpoint": "https://strategy-c.example.com/endpoint"})
 SETTINGS_JSON = json.dumps({"dashboard": "https://network.example.com/dashboard"})
+CLICK_ONLY_JSON = json.dumps({"click": "https://click-triggered.example.com/api"})
 
 
 def _create_app():
@@ -306,18 +321,26 @@ def _create_app():
     async def handle_index(request):
         return web.Response(text=INDEX_HTML, content_type="text/html")
 
+    async def handle_deep(request):
+        return web.Response(text=DEEP_HTML, content_type="text/html")
+
     async def handle_config_json(request):
         return web.Response(text=CONFIG_JSON, content_type="application/json")
 
     async def handle_settings_json(request):
         return web.Response(text=SETTINGS_JSON, content_type="application/json")
 
+    async def handle_click_only_json(request):
+        return web.Response(text=CLICK_ONLY_JSON, content_type="application/json")
+
     async def handle_not_json(request):
         return web.Response(text="<html>not json</html>", content_type="text/html")
 
     app.router.add_get("/", handle_index)
+    app.router.add_get("/deep", handle_deep)
     app.router.add_get("/config.json", handle_config_json)
     app.router.add_get("/api/settings.json", handle_settings_json)
+    app.router.add_get("/api/click-only.json", handle_click_only_json)
     app.router.add_get("/not-json", handle_not_json)
     return app
 
@@ -406,6 +429,43 @@ async def test_output_file_writing(test_server, tmp_path):
         assert "source" in entry
         assert "urls" in entry
         assert isinstance(entry["urls"], list)
+
+
+@pytest.mark.asyncio
+async def test_default_single_url_unchanged(test_server):
+    """Without follow_links/interact, deep-route and click-only URLs must NOT appear."""
+    sources = await crawl(test_server, timeout=10000, wait_after_load=2000)
+    all_urls = {u for s in sources for u in s.urls_found}
+    assert "https://deep-page.example.com/api" not in all_urls
+    assert "https://click-triggered.example.com/api" not in all_urls
+
+
+@pytest.mark.asyncio
+async def test_follow_links_finds_deep_route(test_server):
+    """With follow_links=True the crawler should discover /deep and capture its config."""
+    sources = await crawl(
+        test_server,
+        timeout=10000,
+        wait_after_load=2000,
+        follow_links=True,
+        max_pages=3,
+    )
+    all_urls = {u for s in sources for u in s.urls_found}
+    assert "https://deep-page.example.com/api" in all_urls
+
+
+@pytest.mark.asyncio
+async def test_interaction_triggers_xhr(test_server):
+    """With interact=True, the click-only fetch should be captured."""
+    sources = await crawl(
+        test_server,
+        timeout=10000,
+        wait_after_load=2000,
+        interact=True,
+        interact_budget_ms=6000,
+    )
+    all_urls = {u for s in sources for u in s.urls_found}
+    assert "https://click-triggered.example.com/api" in all_urls
 
 
 # ===========================================================================
