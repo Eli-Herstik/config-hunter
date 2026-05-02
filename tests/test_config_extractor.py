@@ -314,6 +314,19 @@ CONFIG_JSON = json.dumps({"endpoint": "https://strategy-c.example.com/endpoint"}
 SETTINGS_JSON = json.dumps({"dashboard": "https://network.example.com/dashboard"})
 CLICK_ONLY_JSON = json.dumps({"click": "https://click-triggered.example.com/api"})
 
+# Simulated lazy chunk (never loaded by the entry page) with a hardcoded URL
+CHUNK_ADMIN_JS = (
+    'var ADMIN_API="https://chunk-admin.example.com/api";'
+    'console.log("admin chunk loaded");'
+)
+ASSET_MANIFEST_JSON = json.dumps({
+    "files": {
+        "main.js": "/static/js/main.abc123.js",
+        "admin.chunk.js": "/static/js/chunk-admin.js",
+    },
+    "entrypoints": ["static/js/main.abc123.js"],
+})
+
 
 def _create_app():
     app = web.Application()
@@ -336,12 +349,20 @@ def _create_app():
     async def handle_not_json(request):
         return web.Response(text="<html>not json</html>", content_type="text/html")
 
+    async def handle_asset_manifest(request):
+        return web.Response(text=ASSET_MANIFEST_JSON, content_type="application/json")
+
+    async def handle_chunk_admin(request):
+        return web.Response(text=CHUNK_ADMIN_JS, content_type="application/javascript")
+
     app.router.add_get("/", handle_index)
     app.router.add_get("/deep", handle_deep)
     app.router.add_get("/config.json", handle_config_json)
     app.router.add_get("/api/settings.json", handle_settings_json)
     app.router.add_get("/api/click-only.json", handle_click_only_json)
     app.router.add_get("/not-json", handle_not_json)
+    app.router.add_get("/asset-manifest.json", handle_asset_manifest)
+    app.router.add_get("/static/js/chunk-admin.js", handle_chunk_admin)
     return app
 
 
@@ -434,10 +455,45 @@ async def test_output_file_writing(test_server, tmp_path):
 @pytest.mark.asyncio
 async def test_default_single_url_unchanged(test_server):
     """Without follow_links/interact, deep-route and click-only URLs must NOT appear."""
-    sources = await crawl(test_server, timeout=10000, wait_after_load=2000)
+    sources = await crawl(
+        test_server,
+        timeout=10000,
+        wait_after_load=2000,
+        probe_manifests=False,
+        capture_js=False,
+    )
     all_urls = {u for s in sources for u in s.urls_found}
     assert "https://deep-page.example.com/api" not in all_urls
     assert "https://click-triggered.example.com/api" not in all_urls
+    assert "https://chunk-admin.example.com/api" not in all_urls
+
+
+@pytest.mark.asyncio
+async def test_manifest_probe_finds_lazy_chunk_url(test_server):
+    """Manifest probe should fetch chunk-admin.js even though no page links to it."""
+    sources = await crawl(
+        test_server,
+        timeout=10000,
+        wait_after_load=2000,
+        probe_manifests=True,
+        capture_js=True,
+    )
+    all_urls = {u for s in sources for u in s.urls_found}
+    assert "https://chunk-admin.example.com/api" in all_urls
+
+
+@pytest.mark.asyncio
+async def test_no_manifest_probe_skips_lazy_chunk(test_server):
+    """With probe_manifests=False and no JS capture, lazy-chunk URLs must not appear."""
+    sources = await crawl(
+        test_server,
+        timeout=10000,
+        wait_after_load=2000,
+        probe_manifests=False,
+        capture_js=False,
+    )
+    all_urls = {u for s in sources for u in s.urls_found}
+    assert "https://chunk-admin.example.com/api" not in all_urls
 
 
 @pytest.mark.asyncio

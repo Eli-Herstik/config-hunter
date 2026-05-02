@@ -274,6 +274,16 @@ def _is_json_response(response: Response) -> bool:
     return False
 
 
+def _is_js_response(response: Response) -> bool:
+    ct = response.headers.get("content-type", "").lower()
+    if "javascript" in ct or "ecmascript" in ct:
+        return True
+    path = response.url.split("?")[0].split("#")[0]
+    if path.endswith((".js", ".mjs", ".cjs")):
+        return True
+    return False
+
+
 def _exceeds_size_limit(response: Response) -> bool:
     cl = response.headers.get("content-length", "")
     if cl.isdigit() and int(cl) > MAX_PAYLOAD_BYTES:
@@ -283,21 +293,27 @@ def _exceeds_size_limit(response: Response) -> bool:
 
 async def capture_response(
     response: Response,
-    captured: list[tuple[str, str]],
+    captured_json: list[tuple[str, str]],
+    captured_js: list[tuple[str, str]] | None = None,
 ) -> None:
     if response.status < 200 or response.status >= 300:
         return
-    if not _is_json_response(response):
-        return
     if _exceeds_size_limit(response):
         print(f"  [skip] Response too large: {response.url}", file=sys.stderr)
+        return
+    is_json = _is_json_response(response)
+    is_js = captured_js is not None and not is_json and _is_js_response(response)
+    if not (is_json or is_js):
         return
     try:
         body = await response.text()
         if len(body) > MAX_PAYLOAD_BYTES:
             print(f"  [skip] Body too large: {response.url}", file=sys.stderr)
             return
-        captured.append((response.url, body))
+        if is_json:
+            captured_json.append((response.url, body))
+        else:
+            captured_js.append((response.url, body))
     except Exception:
         pass  # body unavailable (e.g. page navigated away)
 
@@ -317,6 +333,22 @@ def process_network_captures(captured: list[tuple[str, str]]) -> list[ConfigSour
                 json_payload=parsed,
                 urls_found=urls,
                 error=err,
+            ))
+    return sources
+
+
+def process_js_captures(captured: list[tuple[str, str]]) -> list[ConfigSource]:
+    """Extract URLs from captured JS bodies via regex (no JSON parsing)."""
+    sources: list[ConfigSource] = []
+    for url, body in captured:
+        urls = extract_urls_from_text(body)
+        if urls:
+            sources.append(ConfigSource(
+                origin=f"js: {url}",
+                raw_text=body[:200],
+                json_payload=None,
+                urls_found=urls,
+                error=None,
             ))
     return sources
 
@@ -561,10 +593,106 @@ async def _discover_links(page: Page, base_url: str, same_origin_only: bool) -> 
     return out
 
 
+# ---------------------------------------------------------------------------
+# Asset manifest probing
+# ---------------------------------------------------------------------------
+
+# Well-known manifest paths that bundlers expose
+MANIFEST_PATHS = (
+    "/asset-manifest.json",          # Create React App
+    "/manifest.json",                # generic
+    "/.vite/manifest.json",          # Vite (production manifest)
+    "/build/manifest.json",          # Remix / some Vite setups
+    "/static/manifest.json",         # generic /static prefix
+)
+
+# Match webpack/Vite-style chunk references inside manifest JSON / _buildManifest.js
+_CHUNK_LIKE_RE = re.compile(r'["\']([^"\']*\.(?:m?js|cjs))["\']')
+
+
+def _extract_chunk_paths_from_manifest(text: str) -> list[str]:
+    """Pull plausible chunk paths out of a manifest body (JSON or JS)."""
+    paths: list[str] = []
+    seen: set[str] = set()
+
+    parsed, _ = try_parse_json(text)
+    if parsed is not None:
+        def walk(node):
+            if isinstance(node, str):
+                if node.endswith((".js", ".mjs", ".cjs")) and node not in seen:
+                    seen.add(node)
+                    paths.append(node)
+            elif isinstance(node, dict):
+                for v in node.values():
+                    walk(v)
+            elif isinstance(node, list):
+                for v in node:
+                    walk(v)
+        walk(parsed)
+
+    # Always also regex-scan: handles _buildManifest.js (not JSON) and JSON
+    # values where chunk paths are embedded in templated strings.
+    for m in _CHUNK_LIKE_RE.findall(text):
+        if m and m not in seen:
+            seen.add(m)
+            paths.append(m)
+
+    return paths
+
+
+async def _probe_manifests(
+    context,
+    base_url: str,
+    captured_js: list[tuple[str, str]],
+    captured_json: list[tuple[str, str]],
+) -> int:
+    """Try well-known manifest paths; fetch any referenced chunks as text.
+    Returns number of chunks captured."""
+    seen_chunks: set[str] = {u for u, _ in captured_js}
+    chunks_added = 0
+
+    for manifest_rel in MANIFEST_PATHS:
+        manifest_url = urljoin(base_url, manifest_rel)
+        try:
+            resp = await context.request.get(manifest_url, timeout=5000)
+            if resp.status < 200 or resp.status >= 300:
+                continue
+            body = await resp.text()
+        except Exception:
+            continue
+        if not body or len(body) > MAX_PAYLOAD_BYTES:
+            continue
+
+        # The manifest itself often contains URLs worth harvesting
+        captured_json.append((manifest_url, body))
+        print(f"  [manifest] {manifest_url}")
+
+        chunk_paths = _extract_chunk_paths_from_manifest(body)
+        for chunk_path in chunk_paths:
+            chunk_abs = urljoin(manifest_url, chunk_path)
+            if chunk_abs in seen_chunks:
+                continue
+            seen_chunks.add(chunk_abs)
+            try:
+                cresp = await context.request.get(chunk_abs, timeout=5000)
+                if cresp.status < 200 or cresp.status >= 300:
+                    continue
+                cbody = await cresp.text()
+                if not cbody or len(cbody) > MAX_PAYLOAD_BYTES:
+                    continue
+                captured_js.append((chunk_abs, cbody))
+                chunks_added += 1
+            except Exception:
+                continue
+
+    return chunks_added
+
+
 async def _crawl_one_page(
     context,
     url: str,
     captured: list[tuple[str, str]],
+    captured_js: list[tuple[str, str]] | None,
     captured_urls: set[str],
     timeout: int,
     wait_after_load: int,
@@ -574,7 +702,7 @@ async def _crawl_one_page(
     """Visit one URL; return (dom_sources, discovered_links)."""
     page = await context.new_page()
     page.on("response", lambda resp: asyncio.ensure_future(
-        capture_response(resp, captured)
+        capture_response(resp, captured, captured_js)
     ))
 
     print(f"Navigating to {url} ...")
@@ -614,6 +742,8 @@ async def crawl(
     follow_links: bool = False,
     max_pages: int = 1,
     same_origin_only: bool = True,
+    capture_js: bool = True,
+    probe_manifests: bool = True,
 ) -> list[ConfigSource]:
     if isinstance(url, str):
         seeds = [url]
@@ -623,6 +753,7 @@ async def crawl(
         return []
 
     captured: list[tuple[str, str]] = []
+    captured_js: list[tuple[str, str]] | None = [] if capture_js else None
     all_dom_sources: list[ConfigSource] = []
 
     queue: list[str] = []
@@ -640,6 +771,7 @@ async def crawl(
         context = await browser.new_context()
 
         pages_visited = 0
+        manifest_probed = False
         while queue and pages_visited < max_pages:
             current = queue.pop(0)
             captured_urls = {u for u, _ in captured}
@@ -647,6 +779,7 @@ async def crawl(
                 context=context,
                 url=current,
                 captured=captured,
+                captured_js=captured_js,
                 captured_urls=captured_urls,
                 timeout=timeout,
                 wait_after_load=wait_after_load,
@@ -655,6 +788,13 @@ async def crawl(
             )
             all_dom_sources.extend(dom_sources)
             pages_visited += 1
+
+            # Manifest probe — once, after the first page renders, against the seed origin
+            if probe_manifests and not manifest_probed and captured_js is not None:
+                manifest_probed = True
+                added = await _probe_manifests(context, seeds[0], captured_js, captured)
+                if added:
+                    print(f"  [manifest] captured {added} chunk(s)")
 
             if follow_links and pages_visited < max_pages:
                 for link in discovered:
@@ -669,8 +809,12 @@ async def crawl(
         await browser.close()
 
     print(f"Captured {len(captured)} JSON network responses across {pages_visited} page(s).")
+    if captured_js is not None:
+        print(f"Captured {len(captured_js)} JS bodies (chunks/manifests).")
+
     network_sources = process_network_captures(captured)
-    return network_sources + all_dom_sources
+    js_sources = process_js_captures(captured_js) if captured_js is not None else []
+    return network_sources + js_sources + all_dom_sources
 
 
 # ---------------------------------------------------------------------------
@@ -834,6 +978,14 @@ def main() -> None:
         "--interact-budget", type=int, default=8000,
         help="Per-page interaction budget in ms (default: 8000)",
     )
+    parser.add_argument(
+        "--no-capture-js", action="store_true",
+        help="Disable capture/parsing of JS bodies (chunks)",
+    )
+    parser.add_argument(
+        "--no-manifest-probe", action="store_true",
+        help="Disable probing well-known asset-manifest paths for chunks",
+    )
     args = parser.parse_args()
 
     seeds: list[str] = [args.url]
@@ -858,6 +1010,8 @@ def main() -> None:
         follow_links=args.follow_links,
         max_pages=args.max_pages,
         same_origin_only=not args.cross_origin,
+        capture_js=not args.no_capture_js,
+        probe_manifests=not args.no_manifest_probe,
     ))
 
     all_urls: list[str] = []
