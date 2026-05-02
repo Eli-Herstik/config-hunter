@@ -1,0 +1,4 @@
+playwright>=1.40
+pytest
+pytest-asyncio
+aiohttp
