@@ -25,14 +25,9 @@ from config_extractor import (
     write_results,
     crawl,
     ConfigSource,
-    AuthHint,
     AuthInfo,
     ProbeResult,
-    _redact_value,
-    _match_auth_key,
     _host_root_url,
-    find_auth_context,
-    run_static_auth_analysis,
     probe_urls,
     merge_probe_results,
     reconcile_auth,
@@ -418,187 +413,6 @@ async def test_output_file_writing(test_server, tmp_path):
 # ===========================================================================
 
 
-class TestRedactValue:
-    def test_long_string(self):
-        assert _redact_value("sk-1234567890") == "sk-1***"
-
-    def test_short_string(self):
-        assert _redact_value("ab") == "[present]"
-
-    def test_exactly_four(self):
-        assert _redact_value("abcd") == "abcd***"
-
-    def test_non_string(self):
-        assert _redact_value(12345) == "[present]"
-
-    def test_empty_string(self):
-        assert _redact_value("") == "[present]"
-
-
-class TestMatchAuthKey:
-    def test_api_key(self):
-        assert _match_auth_key("apiKey") == "api_key"
-        assert _match_auth_key("api_key") == "api_key"
-        assert _match_auth_key("API-KEY") == "api_key"
-
-    def test_bearer(self):
-        assert _match_auth_key("accessToken") == "bearer"
-        assert _match_auth_key("access_token") == "bearer"
-        assert _match_auth_key("bearerToken") == "bearer"
-        assert _match_auth_key("token") == "bearer"
-
-    def test_oauth(self):
-        assert _match_auth_key("clientId") == "oauth"
-        assert _match_auth_key("client_secret") == "oauth"
-        assert _match_auth_key("oauth") == "oauth"
-
-    def test_basic(self):
-        assert _match_auth_key("username") == "basic"
-        assert _match_auth_key("password") == "basic"
-
-    def test_cookie_session(self):
-        assert _match_auth_key("sessionId") == "cookie_session"
-        assert _match_auth_key("session_token") == "cookie_session"
-        assert _match_auth_key("csrf_token") == "cookie_session"
-
-    def test_custom_header(self):
-        assert _match_auth_key("authorization") == "custom_header"
-        # x-api-key matches api_key pattern first (which is correct — it IS an API key header)
-        assert _match_auth_key("x-api-key") == "api_key"
-
-    def test_no_match(self):
-        assert _match_auth_key("url") is None
-        assert _match_auth_key("endpoint") is None
-        assert _match_auth_key("name") is None
-
-
-class TestFindAuthContext:
-    def test_sibling_api_key(self):
-        """Auth key as immediate sibling of URL → high confidence."""
-        obj = {
-            "apiUrl": "https://api.example.com/v1",
-            "apiKey": "sk-test-1234567890",
-        }
-        hints = find_auth_context(obj, "test")
-        assert len(hints) == 1
-        assert hints[0].method == "api_key"
-        assert hints[0].confidence == "high"
-        assert hints[0].evidence_key == "apiKey"
-        assert hints[0].evidence_value == "sk-t***"
-
-    def test_sibling_bearer_token(self):
-        obj = {
-            "endpoint": "https://api.example.com",
-            "accessToken": "eyJhbGciOiJIUzI1NiJ9",
-        }
-        hints = find_auth_context(obj, "test")
-        assert len(hints) == 1
-        assert hints[0].method == "bearer"
-        assert hints[0].confidence == "high"
-
-    def test_child_auth_dict(self):
-        """Auth keys in child dict of URL container → medium confidence."""
-        obj = {
-            "url": "https://api.example.com",
-            "auth": {
-                "username": "admin",
-                "password": "secret123",
-            },
-        }
-        hints = find_auth_context(obj, "test")
-        methods = {h.method for h in hints}
-        assert "basic" in methods
-        assert all(h.confidence == "medium" for h in hints)
-
-    def test_no_url_no_hints(self):
-        """Dict without URLs produces no hints even with auth keys."""
-        obj = {"apiKey": "sk-test-1234", "name": "test"}
-        hints = find_auth_context(obj, "test")
-        assert len(hints) == 0
-
-    def test_nested_service_config(self):
-        """Nested service with URL in child and auth key in parent."""
-        obj = {
-            "token": "abc12345",
-            "service": {
-                "url": "https://api.example.com",
-                "version": "v2",
-            },
-        }
-        hints = find_auth_context(obj, "test")
-        methods = [h.method for h in hints]
-        assert "bearer" in methods
-
-    def test_multiple_services(self):
-        """Multiple services each with their own auth."""
-        obj = {
-            "serviceA": {
-                "url": "https://a.example.com",
-                "apiKey": "key-a-1234",
-            },
-            "serviceB": {
-                "url": "https://b.example.com",
-                "accessToken": "token-b-5678",
-            },
-        }
-        hints = find_auth_context(obj, "test")
-        methods = {h.method for h in hints}
-        assert "api_key" in methods
-        assert "bearer" in methods
-
-    def test_list_of_configs(self):
-        """List containing config dicts."""
-        obj = [
-            {"url": "https://a.example.com", "apiKey": "key123456"},
-        ]
-        hints = find_auth_context(obj, "test")
-        assert len(hints) == 1
-        assert hints[0].method == "api_key"
-
-
-class TestRunStaticAuthAnalysis:
-    def test_associates_hints_with_urls(self):
-        sources = [
-            ConfigSource(
-                origin="test",
-                json_payload={
-                    "endpoint": "https://api.example.com",
-                    "apiKey": "sk-test-1234567890",
-                },
-                urls_found=["https://api.example.com"],
-            ),
-        ]
-        auth_map = run_static_auth_analysis(sources)
-        assert "https://api.example.com" in auth_map
-        info = auth_map["https://api.example.com"]
-        assert len(info.static_hints) > 0
-        assert info.static_hints[0].method == "api_key"
-
-    def test_url_without_auth(self):
-        sources = [
-            ConfigSource(
-                origin="test",
-                json_payload={"cdn": "https://cdn.example.com"},
-                urls_found=["https://cdn.example.com"],
-            ),
-        ]
-        auth_map = run_static_auth_analysis(sources)
-        assert "https://cdn.example.com" in auth_map
-        assert len(auth_map["https://cdn.example.com"].static_hints) == 0
-
-    def test_no_json_payload_skipped(self):
-        sources = [
-            ConfigSource(
-                origin="test",
-                json_payload=None,
-                urls_found=["https://example.com"],
-            ),
-        ]
-        auth_map = run_static_auth_analysis(sources)
-        assert "https://example.com" in auth_map
-        assert len(auth_map["https://example.com"].static_hints) == 0
-
-
 class TestParseWwwAuthenticate:
     def test_basic(self):
         assert _parse_www_authenticate('Basic realm="test"') == "basic"
@@ -621,7 +435,6 @@ class TestReconcileAuth:
         auth_map = {
             "https://api.example.com": AuthInfo(
                 url="https://api.example.com",
-                static_hints=[AuthHint("api_key", "high", "apiKey", "sk-1***", "test")],
                 probe_result=ProbeResult(
                     url="https://api.example.com",
                     status_code=401,
@@ -632,16 +445,6 @@ class TestReconcileAuth:
         }
         reconcile_auth(auth_map)
         assert auth_map["https://api.example.com"].best_guess == "bearer"
-
-    def test_high_static_without_probe(self):
-        auth_map = {
-            "https://api.example.com": AuthInfo(
-                url="https://api.example.com",
-                static_hints=[AuthHint("api_key", "high", "apiKey", "sk-1***", "test")],
-            ),
-        }
-        reconcile_auth(auth_map)
-        assert auth_map["https://api.example.com"].best_guess == "api_key"
 
     def test_probe_200_means_no_auth(self):
         auth_map = {
@@ -657,16 +460,6 @@ class TestReconcileAuth:
         }
         reconcile_auth(auth_map)
         assert auth_map["https://cdn.example.com"].best_guess == "none"
-
-    def test_medium_hint_as_fallback(self):
-        auth_map = {
-            "https://api.example.com": AuthInfo(
-                url="https://api.example.com",
-                static_hints=[AuthHint("bearer", "medium", "token", "abc1***", "test")],
-            ),
-        }
-        reconcile_auth(auth_map)
-        assert auth_map["https://api.example.com"].best_guess == "bearer"
 
     def test_no_info_stays_unknown(self):
         auth_map = {
@@ -979,26 +772,13 @@ async def test_probe_bad_request_no_fallback_when_root_only(auth_server):
 
 
 @pytest.mark.asyncio
-async def test_static_analysis_with_crawl(auth_server):
-    """Crawl the auth test server and verify static auth detection finds apiKey."""
-    sources = await crawl(auth_server, timeout=10000, wait_after_load=2000)
-    auth_map = run_static_auth_analysis(sources)
-
-    # The config.json endpoint has apiKey alongside the URL
-    api_key_found = False
-    for url, info in auth_map.items():
-        for hint in info.static_hints:
-            if hint.method == "api_key" and hint.evidence_key == "apiKey":
-                api_key_found = True
-                break
-    assert api_key_found, "Static analysis should detect apiKey in config.json"
-
-
-@pytest.mark.asyncio
 async def test_write_results_with_auth(auth_server, tmp_path):
     """Verify write_results includes auth section when auth_map is provided."""
     sources = await crawl(auth_server, timeout=10000, wait_after_load=2000)
-    auth_map = run_static_auth_analysis(sources)
+    all_urls = list({u for s in sources for u in s.urls_found})
+    auth_map = {u: AuthInfo(url=u) for u in all_urls}
+    probes = await probe_urls(all_urls, timeout=5.0)
+    merge_probe_results(auth_map, probes)
     reconcile_auth(auth_map)
 
     out_path = str(tmp_path / "results_auth.json")
