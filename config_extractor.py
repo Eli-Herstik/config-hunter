@@ -160,13 +160,17 @@ async def probe_urls(
     urls: list[str],
     timeout: float = 5.0,
     max_concurrent: int = 10,
+    cookies: dict[str, str] | None = None,
+    headers: dict[str, str] | None = None,
 ) -> list[ProbeResult]:
     """Probe a list of URLs for authentication requirements."""
     unique_urls = list(dict.fromkeys(urls))  # deduplicate, preserve order
     semaphore = asyncio.Semaphore(max_concurrent)
-    async with aiohttp.ClientSession(
-        headers={"User-Agent": "ConfigExtractor/1.0"},
-    ) as session:
+    merged_headers = {"User-Agent": "ConfigExtractor/1.0", **(headers or {})}
+    session_kwargs: dict = {"headers": merged_headers}
+    if cookies:
+        session_kwargs["cookies"] = cookies
+    async with aiohttp.ClientSession(**session_kwargs) as session:
         tasks = [_probe_single(session, url, semaphore, timeout) for url in unique_urls]
         return await asyncio.gather(*tasks)
 
@@ -688,6 +692,106 @@ async def _probe_manifests(
     return chunks_added
 
 
+# ---------------------------------------------------------------------------
+# Authentication helpers
+# ---------------------------------------------------------------------------
+
+_LOGIN_URL_RE = re.compile(r"/(login|signin|sign-in|auth/(?:login|signin)|sso)\b", re.IGNORECASE)
+
+
+def _cookies_from_kv(items: list[str], seed_url: str) -> list[dict]:
+    """Parse 'key=value' strings into Playwright cookie dicts.
+    Domain is inferred from the seed URL's host."""
+    host = urlparse(seed_url).hostname or ""
+    cookies: list[dict] = []
+    for item in items:
+        if "=" not in item:
+            print(f"  [warn] Ignoring malformed --cookie {item!r} (expected key=value)", file=sys.stderr)
+            continue
+        name, _, value = item.partition("=")
+        name = name.strip()
+        value = value.strip()
+        if not name:
+            continue
+        cookies.append({
+            "name": name,
+            "value": value,
+            "domain": host,
+            "path": "/",
+        })
+    return cookies
+
+
+def _headers_from_kv(items: list[str]) -> dict[str, str]:
+    """Parse 'Name: Value' strings into a header dict."""
+    headers: dict[str, str] = {}
+    for item in items:
+        if ":" not in item:
+            print(f"  [warn] Ignoring malformed --header {item!r} (expected Name: Value)", file=sys.stderr)
+            continue
+        name, _, value = item.partition(":")
+        name = name.strip()
+        value = value.strip()
+        if name:
+            headers[name] = value
+    return headers
+
+
+def _storage_state_to_probe_cookies(path: str, seed_url: str) -> dict[str, str]:
+    """Read a Playwright storage-state JSON and extract cookies for the seed host
+    as a flat {name: value} dict suitable for aiohttp.ClientSession(cookies=...)."""
+    host = urlparse(seed_url).hostname or ""
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+    except (OSError, json.JSONDecodeError) as e:
+        print(f"  [warn] Could not read storage-state {path}: {e}", file=sys.stderr)
+        return {}
+    out: dict[str, str] = {}
+    for c in data.get("cookies", []):
+        cookie_domain = (c.get("domain") or "").lstrip(".")
+        if not cookie_domain or host == cookie_domain or host.endswith("." + cookie_domain):
+            name = c.get("name")
+            value = c.get("value")
+            if name is not None and value is not None:
+                out[name] = value
+    return out
+
+
+async def _run_login_capture(url: str, save_path: str) -> None:
+    """Open a headed browser, wait for the user to log in, save storage state, exit."""
+    async with async_playwright() as pw:
+        browser = await pw.chromium.launch(headless=False)
+        context = await browser.new_context()
+        page = await context.new_page()
+        try:
+            await page.goto(url)
+        except Exception as e:
+            print(f"  [warn] Initial navigation issue: {e}", file=sys.stderr)
+        print(f"\n  Log in in the browser window, then press Enter here to save the session to {save_path} ...")
+        loop = asyncio.get_running_loop()
+        await loop.run_in_executor(None, input)
+        await context.storage_state(path=save_path)
+        await browser.close()
+        print(f"Saved storage state to {save_path}.")
+
+
+def _check_auth_signal(seed_url: str, final_url: str, status: int | None,
+                      www_authenticate: str | None) -> str | None:
+    """Return a warning string if the seed page looks unauthenticated, else None."""
+    seed_host = urlparse(seed_url).hostname or ""
+    final_host = urlparse(final_url).hostname or ""
+    if status == 401:
+        return f"entry page returned 401 (URL: {final_url})."
+    if www_authenticate:
+        return f"entry page sent WWW-Authenticate: {www_authenticate} (URL: {final_url})."
+    if seed_host and final_host and seed_host != final_host:
+        return f"entry page redirected off-origin to {final_url}."
+    if _LOGIN_URL_RE.search(final_url):
+        return f"final URL looks like a login page: {final_url}."
+    return None
+
+
 async def _crawl_one_page(
     context,
     url: str,
@@ -698,6 +802,7 @@ async def _crawl_one_page(
     wait_after_load: int,
     interact: bool,
     interact_budget_ms: int,
+    is_seed: bool = False,
 ) -> tuple[list[ConfigSource], list[str]]:
     """Visit one URL; return (dom_sources, discovered_links)."""
     page = await context.new_page()
@@ -706,10 +811,18 @@ async def _crawl_one_page(
     ))
 
     print(f"Navigating to {url} ...")
+    response = None
     try:
-        await page.goto(url, wait_until="networkidle", timeout=timeout)
+        response = await page.goto(url, wait_until="networkidle", timeout=timeout)
     except Exception as e:
         print(f"  [warn] Navigation issue for {url}: {e}", file=sys.stderr)
+
+    if is_seed:
+        status = response.status if response else None
+        www_auth = response.headers.get("www-authenticate") if response else None
+        signal = _check_auth_signal(url, page.url, status, www_auth)
+        if signal:
+            print(f"  [auth] {signal} Try --login or refresh --storage-state.", file=sys.stderr)
 
     if wait_after_load > 0:
         await page.wait_for_timeout(wait_after_load)
@@ -744,6 +857,9 @@ async def crawl(
     same_origin_only: bool = True,
     capture_js: bool = True,
     probe_manifests: bool = True,
+    storage_state: str | None = None,
+    extra_http_headers: dict[str, str] | None = None,
+    cookies: list[dict] | None = None,
 ) -> list[ConfigSource]:
     if isinstance(url, str):
         seeds = [url]
@@ -768,7 +884,14 @@ async def crawl(
 
     async with async_playwright() as pw:
         browser = await pw.chromium.launch(headless=not headed)
-        context = await browser.new_context()
+        context_kwargs: dict = {}
+        if storage_state:
+            context_kwargs["storage_state"] = storage_state
+        if extra_http_headers:
+            context_kwargs["extra_http_headers"] = extra_http_headers
+        context = await browser.new_context(**context_kwargs)
+        if cookies:
+            await context.add_cookies(cookies)
 
         pages_visited = 0
         manifest_probed = False
@@ -785,6 +908,7 @@ async def crawl(
                 wait_after_load=wait_after_load,
                 interact=interact,
                 interact_budget_ms=interact_budget_ms,
+                is_seed=(pages_visited == 0),
             )
             all_dom_sources.extend(dom_sources)
             pages_visited += 1
@@ -959,6 +1083,26 @@ def main() -> None:
         help="Path to a file with extra seed URLs (one per line)",
     )
     parser.add_argument(
+        "--login", action="store_true",
+        help="Open a headed browser, wait for manual login, save the session, and exit",
+    )
+    parser.add_argument(
+        "--save-storage", type=str, default="auth.json",
+        help="Output path for --login mode (default: auth.json)",
+    )
+    parser.add_argument(
+        "--storage-state", type=str, default=None,
+        help="Load a Playwright storage-state JSON before crawling",
+    )
+    parser.add_argument(
+        "--cookie", action="append", default=[],
+        help="Set a cookie KEY=VAL (repeatable). Domain inferred from URL.",
+    )
+    parser.add_argument(
+        "--header", action="append", default=[],
+        help='Send an extra HTTP header "Name: Value" (repeatable).',
+    )
+    parser.add_argument(
         "--follow-links", action="store_true",
         help="Auto-discover same-origin links from each crawled page",
     )
@@ -988,6 +1132,10 @@ def main() -> None:
     )
     args = parser.parse_args()
 
+    if args.login:
+        asyncio.run(_run_login_capture(args.url, args.save_storage))
+        return
+
     seeds: list[str] = [args.url]
     if args.routes:
         try:
@@ -999,6 +1147,9 @@ def main() -> None:
         except OSError as e:
             print(f"  [error] Could not read --routes file: {e}", file=sys.stderr)
             sys.exit(2)
+
+    cli_cookies = _cookies_from_kv(args.cookie, args.url)
+    cli_headers = _headers_from_kv(args.header)
 
     sources = asyncio.run(crawl(
         url=seeds if len(seeds) > 1 else args.url,
@@ -1012,6 +1163,9 @@ def main() -> None:
         same_origin_only=not args.cross_origin,
         capture_js=not args.no_capture_js,
         probe_manifests=not args.no_manifest_probe,
+        storage_state=args.storage_state,
+        extra_http_headers=cli_headers or None,
+        cookies=cli_cookies or None,
     ))
 
     all_urls: list[str] = []
@@ -1020,12 +1174,20 @@ def main() -> None:
     unique_urls = list(dict.fromkeys(all_urls))
     auth_map: dict[str, AuthInfo] = {url: AuthInfo(url=url) for url in unique_urls}
 
+    probe_cookies: dict[str, str] = {}
+    if args.storage_state:
+        probe_cookies.update(_storage_state_to_probe_cookies(args.storage_state, args.url))
+    for c in cli_cookies:
+        probe_cookies[c["name"]] = c["value"]
+
     if unique_urls:
         print(f"Probing {len(unique_urls)} URLs for authentication methods...")
         probes = asyncio.run(probe_urls(
             unique_urls,
             timeout=float(args.probe_timeout),
             max_concurrent=args.probe_concurrency,
+            cookies=probe_cookies or None,
+            headers=cli_headers or None,
         ))
         merge_probe_results(auth_map, probes)
         reconcile_auth(auth_map)

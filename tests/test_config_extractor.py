@@ -32,6 +32,10 @@ from config_extractor import (
     merge_probe_results,
     reconcile_auth,
     _parse_www_authenticate,
+    _cookies_from_kv,
+    _headers_from_kv,
+    _storage_state_to_probe_cookies,
+    _check_auth_signal,
 )
 
 
@@ -295,6 +299,7 @@ INDEX_HTML = """\
   <a href="/deep">Deep page</a>
   <button id="load" type="button"
     onclick="fetch('/api/click-only.json')">Load extra config</button>
+  <script>fetch("/protected/config.json").catch(function(){});</script>
 </body>
 </html>
 """
@@ -313,6 +318,7 @@ DEEP_HTML = """\
 CONFIG_JSON = json.dumps({"endpoint": "https://strategy-c.example.com/endpoint"})
 SETTINGS_JSON = json.dumps({"dashboard": "https://network.example.com/dashboard"})
 CLICK_ONLY_JSON = json.dumps({"click": "https://click-triggered.example.com/api"})
+PROTECTED_CONFIG_JSON = json.dumps({"protected_url": "https://protected-api.example.com/v1"})
 
 # Simulated lazy chunk (never loaded by the entry page) with a hardcoded URL
 CHUNK_ADMIN_JS = (
@@ -355,6 +361,11 @@ def _create_app():
     async def handle_chunk_admin(request):
         return web.Response(text=CHUNK_ADMIN_JS, content_type="application/javascript")
 
+    async def handle_protected_config(request):
+        if request.cookies.get("session") == "abc":
+            return web.Response(text=PROTECTED_CONFIG_JSON, content_type="application/json")
+        return web.Response(status=401, text="Unauthorized")
+
     app.router.add_get("/", handle_index)
     app.router.add_get("/deep", handle_deep)
     app.router.add_get("/config.json", handle_config_json)
@@ -363,6 +374,7 @@ def _create_app():
     app.router.add_get("/not-json", handle_not_json)
     app.router.add_get("/asset-manifest.json", handle_asset_manifest)
     app.router.add_get("/static/js/chunk-admin.js", handle_chunk_admin)
+    app.router.add_get("/protected/config.json", handle_protected_config)
     return app
 
 
@@ -466,6 +478,7 @@ async def test_default_single_url_unchanged(test_server):
     assert "https://deep-page.example.com/api" not in all_urls
     assert "https://click-triggered.example.com/api" not in all_urls
     assert "https://chunk-admin.example.com/api" not in all_urls
+    assert "https://protected-api.example.com/v1" not in all_urls
 
 
 @pytest.mark.asyncio
@@ -907,3 +920,164 @@ async def test_write_results_with_auth(auth_server, tmp_path):
     assert isinstance(data["auth"], dict)
     for url, auth_entry in data["auth"].items():
         assert "best_guess" in auth_entry
+
+
+# ===========================================================================
+# Part 6: Authenticated Sessions
+# ===========================================================================
+
+
+class TestCookiesFromKv:
+    def test_basic_kv(self):
+        cookies = _cookies_from_kv(["session=abc"], "https://app.example.com/")
+        assert cookies == [{"name": "session", "value": "abc",
+                            "domain": "app.example.com", "path": "/"}]
+
+    def test_value_with_equals(self):
+        cookies = _cookies_from_kv(["token=a=b=c"], "https://x.test/")
+        assert cookies[0]["value"] == "a=b=c"
+
+    def test_multiple(self):
+        cookies = _cookies_from_kv(["a=1", "b=2"], "https://x.test/")
+        assert {c["name"] for c in cookies} == {"a", "b"}
+
+    def test_malformed_skipped(self):
+        cookies = _cookies_from_kv(["bogus", "ok=yes"], "https://x.test/")
+        assert len(cookies) == 1
+        assert cookies[0]["name"] == "ok"
+
+
+class TestHeadersFromKv:
+    def test_basic(self):
+        h = _headers_from_kv(["Authorization: Bearer xyz"])
+        assert h == {"Authorization": "Bearer xyz"}
+
+    def test_value_with_colon(self):
+        h = _headers_from_kv(["X-Trace: abc:def:ghi"])
+        assert h["X-Trace"] == "abc:def:ghi"
+
+    def test_malformed_skipped(self):
+        h = _headers_from_kv(["bogus", "Ok: yes"])
+        assert h == {"Ok": "yes"}
+
+
+class TestStorageStateToProbeCookies:
+    def test_extracts_matching_host(self, tmp_path):
+        path = tmp_path / "auth.json"
+        path.write_text(json.dumps({
+            "cookies": [
+                {"name": "session", "value": "abc", "domain": "127.0.0.1"},
+                {"name": "other", "value": "xyz", "domain": "other.example.com"},
+            ],
+            "origins": [],
+        }))
+        cookies = _storage_state_to_probe_cookies(str(path), "http://127.0.0.1:8080/")
+        assert cookies == {"session": "abc"}
+
+    def test_missing_file_returns_empty(self, tmp_path):
+        cookies = _storage_state_to_probe_cookies(str(tmp_path / "nope.json"),
+                                                  "https://app.example.com/")
+        assert cookies == {}
+
+    def test_dotted_domain_matches_subdomain(self, tmp_path):
+        path = tmp_path / "auth.json"
+        path.write_text(json.dumps({
+            "cookies": [{"name": "s", "value": "1", "domain": ".example.com"}],
+            "origins": [],
+        }))
+        cookies = _storage_state_to_probe_cookies(str(path), "https://app.example.com/")
+        assert cookies == {"s": "1"}
+
+
+class TestCheckAuthSignal:
+    def test_clean_returns_none(self):
+        assert _check_auth_signal("https://app.example.com/",
+                                  "https://app.example.com/", 200, None) is None
+
+    def test_401_signal(self):
+        msg = _check_auth_signal("https://app.example.com/",
+                                 "https://app.example.com/", 401, None)
+        assert msg and "401" in msg
+
+    def test_www_authenticate_signal(self):
+        msg = _check_auth_signal("https://app.example.com/",
+                                 "https://app.example.com/", 200, "Bearer")
+        assert msg and "Bearer" in msg
+
+    def test_off_origin_redirect(self):
+        msg = _check_auth_signal("https://app.example.com/",
+                                 "https://idp.example.com/login", 200, None)
+        assert msg and "idp.example.com" in msg
+
+    def test_login_url_pattern(self):
+        msg = _check_auth_signal("https://app.example.com/",
+                                 "https://app.example.com/login", 200, None)
+        assert msg and "login" in msg
+
+
+@pytest.mark.asyncio
+async def test_crawl_with_cookie_finds_protected_config(test_server):
+    """With session cookie set on the context, the protected URL is captured."""
+    host = test_server.replace("http://", "").split(":")[0]
+    sources = await crawl(
+        test_server,
+        timeout=10000,
+        wait_after_load=2000,
+        cookies=[{"name": "session", "value": "abc", "domain": host, "path": "/"}],
+    )
+    all_urls = {u for s in sources for u in s.urls_found}
+    assert "https://protected-api.example.com/v1" in all_urls
+
+
+@pytest.mark.asyncio
+async def test_crawl_without_cookie_misses_protected_config(test_server):
+    """Without the session cookie, the protected URL must not appear."""
+    sources = await crawl(test_server, timeout=10000, wait_after_load=2000)
+    all_urls = {u for s in sources for u in s.urls_found}
+    assert "https://protected-api.example.com/v1" not in all_urls
+
+
+@pytest.mark.asyncio
+async def test_storage_state_roundtrip(test_server, tmp_path):
+    """A Playwright storage-state JSON file with the right cookie should unlock the route."""
+    host = test_server.replace("http://", "").split(":")[0]
+    state_path = tmp_path / "auth.json"
+    state_path.write_text(json.dumps({
+        "cookies": [{
+            "name": "session", "value": "abc",
+            "domain": host, "path": "/",
+            "expires": -1, "httpOnly": False,
+            "secure": False, "sameSite": "Lax",
+        }],
+        "origins": [],
+    }))
+    sources = await crawl(
+        test_server,
+        timeout=10000,
+        wait_after_load=2000,
+        storage_state=str(state_path),
+    )
+    all_urls = {u for s in sources for u in s.urls_found}
+    assert "https://protected-api.example.com/v1" in all_urls
+
+
+@pytest.mark.asyncio
+async def test_probe_urls_with_cookie(test_server):
+    """probe_urls should send cookies and see 200 instead of 401."""
+    url = f"{test_server}/protected/config.json"
+
+    no_cookie = await probe_urls([url], timeout=5.0)
+    assert no_cookie[0].status_code == 401
+
+    with_cookie = await probe_urls([url], timeout=5.0, cookies={"session": "abc"})
+    assert with_cookie[0].status_code == 200
+
+
+@pytest.mark.asyncio
+async def test_probe_urls_with_extra_header(test_server):
+    """Extra headers passed to probe_urls should be merged with the User-Agent."""
+    # /config.json doesn't gate on headers, but we verify the call shape works.
+    url = f"{test_server}/config.json"
+    results = await probe_urls([url], timeout=5.0,
+                               headers={"X-Custom": "test"})
+    assert results[0].status_code == 200
