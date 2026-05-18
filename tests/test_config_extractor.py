@@ -15,6 +15,8 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from config_extractor import (
     _clean_url,
+    _classify_url,
+    _partition_urls,
     extract_urls,
     extract_urls_from_text,
     sanitize_js_object,
@@ -73,6 +75,64 @@ class TestCleanUrl:
 
     def test_trailing_paren(self):
         assert _clean_url("https://example.com/path)") == "https://example.com/path"
+
+    def test_trailing_backslash(self):
+        assert _clean_url("https://example.com/path\\") == "https://example.com/path"
+
+
+class TestClassifyUrl:
+    def test_clean_url_returns_none(self):
+        assert _classify_url("https://example.com/path") is None
+
+    def test_template_flagged(self):
+        assert _classify_url("https://${host}/path") == "template"
+
+    def test_partial_template_flagged(self):
+        assert _classify_url("https://${e") == "template"
+
+    def test_backtick_flagged(self):
+        assert _classify_url("https://example.com/`") == "template"
+
+    def test_dollar_in_query_clean(self):
+        # $ outside the hostname is fine — RFC 3986 sub-delim
+        assert _classify_url("https://example.com/api?id=$1") is None
+
+    def test_empty_host_flagged(self):
+        assert _classify_url("http://") == "bad_host"
+
+    def test_percent_in_host_flagged(self):
+        assert _classify_url("https://www.%/path") == "bad_host"
+
+    def test_underscore_in_host_flagged(self):
+        # 'mock_section_url'-style placeholders
+        assert _classify_url("https://mock_section_url/x") == "bad_host"
+
+    def test_localhost_clean(self):
+        assert _classify_url("http://localhost:8080/api") is None
+
+
+class TestPartitionUrls:
+    def test_split(self):
+        clean, suspect = _partition_urls([
+            "https://real.example.com/a",
+            "https://${e}/b",
+            "https://www.%/c",
+            "https://other.example.com/d",
+        ])
+        assert clean == ["https://real.example.com/a", "https://other.example.com/d"]
+        assert suspect == [
+            ("https://${e}/b", "template"),
+            ("https://www.%/c", "bad_host"),
+        ]
+
+    def test_all_clean(self):
+        clean, suspect = _partition_urls(["https://a.example.com", "https://b.example.com"])
+        assert len(clean) == 2 and suspect == []
+
+    def test_all_suspect(self):
+        clean, suspect = _partition_urls(["http://", "https://${x"])
+        assert clean == []
+        assert {r for _, r in suspect} == {"bad_host", "template"}
 
 
 class TestExtractUrls:
@@ -456,12 +516,40 @@ async def test_output_file_writing(test_server, tmp_path):
     assert isinstance(data, dict)
     assert "sources" in data
     assert "unique_hosts" in data
+    assert "suspect_urls" in data
     assert isinstance(data["unique_hosts"], list)
+    assert isinstance(data["suspect_urls"], list)
     assert len(data["sources"]) > 0
     for entry in data["sources"]:
         assert "source" in entry
         assert "urls" in entry
         assert isinstance(entry["urls"], list)
+
+
+def test_write_results_quarantines_suspect_urls(tmp_path):
+    sources = [ConfigSource(
+        origin="js: https://test/bundle.js",
+        urls_found=[
+            "https://real.example.com/api",
+            "https://${env}/x",
+            "https://www.%/y",
+        ],
+    )]
+    out = tmp_path / "r.json"
+    write_results(sources, str(out))
+    with open(out, "r", encoding="utf-8") as f:
+        data = json.load(f)
+
+    assert data["sources"][0]["urls"] == ["https://real.example.com/api"]
+    assert data["unique_hosts"] == ["real.example.com"]
+    assert {s["url"] for s in data["suspect_urls"]} == {
+        "https://${env}/x", "https://www.%/y",
+    }
+    reasons = {s["url"]: s["reason"] for s in data["suspect_urls"]}
+    assert reasons["https://${env}/x"] == "template"
+    assert reasons["https://www.%/y"] == "bad_host"
+    for s in data["suspect_urls"]:
+        assert s["sources"] == ["js: https://test/bundle.js"]
 
 
 @pytest.mark.asyncio

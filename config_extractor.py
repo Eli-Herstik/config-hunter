@@ -9,6 +9,7 @@ import argparse
 import asyncio
 import json
 import re
+import string
 import sys
 from dataclasses import dataclass, field
 from urllib.parse import urljoin, urlparse
@@ -205,7 +206,35 @@ URL_RE = re.compile(r'https?://[^\s"\'<>}\]\)]+')
 
 
 def _clean_url(url: str) -> str:
-    return url.rstrip(".,;:)")
+    return url.rstrip(".,;:)\\")
+
+
+_VALID_HOSTNAME_CHARS = set(string.ascii_letters + string.digits + ".-")
+
+
+def _classify_url(url: str) -> str | None:
+    """Return a 'suspect' reason if the URL should be quarantined, else None."""
+    if "${" in url or "`" in url:
+        return "template"
+    host = urlparse(url).hostname
+    if not host:
+        return "bad_host"
+    if not all(c in _VALID_HOSTNAME_CHARS for c in host):
+        return "bad_host"
+    return None
+
+
+def _partition_urls(urls: list[str]) -> tuple[list[str], list[tuple[str, str]]]:
+    """Split URLs into (clean, [(suspect_url, reason), ...])."""
+    clean: list[str] = []
+    suspect: list[tuple[str, str]] = []
+    for u in urls:
+        reason = _classify_url(u)
+        if reason is None:
+            clean.append(u)
+        else:
+            suspect.append((u, reason))
+    return clean, suspect
 
 
 def extract_urls(obj, seen: set[str] | None = None) -> list[str]:
@@ -953,18 +982,21 @@ def print_results(
         print("\nNo JSON configurations with URLs were found.")
         return
 
-    all_urls: set[str] = set()
+    all_clean: set[str] = set()
+    suspect_count = 0
     print(f"\n{'=' * 70}")
     for src in sources:
+        clean, suspect = _partition_urls(src.urls_found)
+        suspect_count += len(suspect)
         print(f"\n  Source: {src.origin}")
         if src.error:
             print(f"  (JSON parse error — used regex fallback: {src.error})")
-        print(f"  URLs found: {len(src.urls_found)}")
-        for u in src.urls_found:
+        print(f"  URLs found: {len(clean)}")
+        for u in clean:
             print(f"    {u}")
-            all_urls.add(u)
+            all_clean.add(u)
     hosts: set[str] = set()
-    for u in all_urls:
+    for u in all_clean:
         host = urlparse(u).hostname
         if host:
             hosts.add(host)
@@ -972,7 +1004,7 @@ def print_results(
 
     print(f"\n{'=' * 70}")
     print(f"Total config sources: {len(sources)}")
-    print(f"Total unique URLs:    {len(all_urls)}")
+    print(f"Total unique URLs:    {len(all_clean)}")
     if sorted_hosts:
         print(f"\nUnique hosts ({len(sorted_hosts)}):")
         for h in sorted_hosts:
@@ -999,6 +1031,9 @@ def print_results(
             print(f"    Verdict: {info.best_guess}")
         print(f"\n{'=' * 70}")
 
+    if suspect_count:
+        print(f"\nSuspect URLs (skipped probe): {suspect_count}")
+
     print()
 
 
@@ -1007,25 +1042,37 @@ def write_results(
     path: str,
     auth_map: dict[str, AuthInfo] | None = None,
 ) -> None:
-    all_urls: set[str] = set()
+    all_clean: set[str] = set()
+    suspect_index: dict[str, dict] = {}
     entries = []
     for src in sources:
+        clean, suspect = _partition_urls(src.urls_found)
         entries.append({
             "source": src.origin,
-            "urls": src.urls_found,
+            "urls": clean,
             "error": src.error,
         })
-        all_urls.update(src.urls_found)
+        all_clean.update(clean)
+        for url, reason in suspect:
+            entry = suspect_index.setdefault(url, {"reason": reason, "sources": []})
+            if src.origin not in entry["sources"]:
+                entry["sources"].append(src.origin)
 
     hosts: set[str] = set()
-    for u in all_urls:
+    for u in all_clean:
         host = urlparse(u).hostname
         if host:
             hosts.add(host)
 
+    suspect_urls = [
+        {"url": url, "reason": entry["reason"], "sources": entry["sources"]}
+        for url, entry in sorted(suspect_index.items())
+    ]
+
     output: dict = {
         "sources": entries,
         "unique_hosts": sorted(hosts),
+        "suspect_urls": suspect_urls,
     }
 
     if auth_map:
@@ -1171,7 +1218,7 @@ def main() -> None:
     all_urls: list[str] = []
     for src in sources:
         all_urls.extend(src.urls_found)
-    unique_urls = list(dict.fromkeys(all_urls))
+    unique_urls = [u for u in dict.fromkeys(all_urls) if _classify_url(u) is None]
     auth_map: dict[str, AuthInfo] = {url: AuthInfo(url=url) for url in unique_urls}
 
     probe_cookies: dict[str, str] = {}
