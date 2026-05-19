@@ -6,6 +6,7 @@ import sys
 import os
 import threading
 
+import aiohttp
 import pytest
 import pytest_asyncio
 from aiohttp import web
@@ -38,6 +39,7 @@ from config_extractor import (
     _headers_from_kv,
     _storage_state_to_probe_cookies,
     _check_auth_signal,
+    _build_arg_parser,
 )
 
 
@@ -1169,3 +1171,77 @@ async def test_probe_urls_with_extra_header(test_server):
     results = await probe_urls([url], timeout=5.0,
                                headers={"X-Custom": "test"})
     assert results[0].status_code == 200
+
+
+# ===========================================================================
+# Part 7: TLS / proxy handling (corporate-network survival)
+# ===========================================================================
+
+
+@pytest.mark.asyncio
+async def test_probe_urls_default_passes_trust_env_true(monkeypatch):
+    """Default invocation must construct ClientSession with trust_env=True so
+    corporate HTTPS_PROXY/HTTP_PROXY/NO_PROXY env vars are honored."""
+    captured: dict = {}
+    real_cls = aiohttp.ClientSession
+
+    def _spy(*a, **kw):
+        captured["kwargs"] = kw
+        return real_cls(*a, **kw)
+
+    monkeypatch.setattr("config_extractor.aiohttp.ClientSession", _spy)
+    # Unroutable address: request fails fast; we only care about session kwargs.
+    await probe_urls(["http://192.0.2.1:1/x"], timeout=0.5)
+    assert captured["kwargs"].get("trust_env") is True
+
+
+@pytest.mark.asyncio
+async def test_probe_urls_insecure_tls_builds_ssl_false_connector(monkeypatch):
+    """probe_urls(verify_tls=False) must build TCPConnector with ssl=False so
+    aiohttp accepts hosts whose corp CA isn't in the OS trust store."""
+    captured: dict = {}
+    real_cls = aiohttp.TCPConnector
+
+    def _spy(*a, **kw):
+        captured["kwargs"] = kw
+        return real_cls(*a, **kw)
+
+    monkeypatch.setattr("config_extractor.aiohttp.TCPConnector", _spy)
+    await probe_urls(["http://192.0.2.1:1/x"], timeout=0.5, verify_tls=False)
+    assert captured["kwargs"].get("ssl") is False
+
+
+@pytest.mark.asyncio
+async def test_probe_urls_no_proxy_augments_and_restores_env(monkeypatch):
+    """no_proxy is concatenated onto NO_PROXY during the call and restored after."""
+    monkeypatch.setenv("NO_PROXY", "existing.example")
+    saw: dict = {}
+    real_cls = aiohttp.ClientSession
+
+    def _spy(*a, **kw):
+        saw["no_proxy_during"] = os.environ.get("NO_PROXY")
+        return real_cls(*a, **kw)
+
+    monkeypatch.setattr("config_extractor.aiohttp.ClientSession", _spy)
+    await probe_urls(["http://192.0.2.1:1/x"], timeout=0.5,
+                     no_proxy="foo.internal,bar.internal")
+
+    assert "existing.example" in saw["no_proxy_during"]
+    assert "foo.internal" in saw["no_proxy_during"]
+    assert "bar.internal" in saw["no_proxy_during"]
+    # Restored after the call returns
+    assert os.environ.get("NO_PROXY") == "existing.example"
+
+
+def test_cli_parses_insecure_tls_and_no_proxy():
+    args = _build_arg_parser().parse_args(
+        ["http://x.test", "--insecure-tls", "--no-proxy", "a,b,c"]
+    )
+    assert args.insecure_tls is True
+    assert args.no_proxy == "a,b,c"
+
+
+def test_cli_insecure_tls_and_no_proxy_defaults():
+    args = _build_arg_parser().parse_args(["http://x.test"])
+    assert args.insecure_tls is False
+    assert args.no_proxy is None

@@ -8,11 +8,30 @@ and harvests all HTTP/HTTPS URLs found within them.
 import argparse
 import asyncio
 import json
+import os
 import re
 import string
 import sys
 from dataclasses import dataclass, field
 from urllib.parse import urljoin, urlparse
+
+# Inject native OS trust store into ssl BEFORE aiohttp imports so its default
+# TCPConnector picks up the patched ssl.SSLContext. On corporate networks this
+# lets aiohttp validate HTTPS against the Windows/macOS/Linux trust store
+# (where the corporate root CA usually lives) instead of certifi's bundled list.
+try:
+    import truststore
+    truststore.inject_into_ssl()
+    _TRUSTSTORE_AVAILABLE = True
+except ImportError:
+    _TRUSTSTORE_AVAILABLE = False
+    if sys.version_info >= (3, 10):
+        print("  [warn] 'truststore' not installed — OS trust store ignored. "
+              "Install: pip install truststore", file=sys.stderr)
+    else:
+        print(f"  [warn] Python {sys.version_info.major}.{sys.version_info.minor} "
+              "< 3.10 — truststore unavailable; aiohttp uses certifi only.",
+              file=sys.stderr)
 
 import aiohttp
 
@@ -163,17 +182,37 @@ async def probe_urls(
     max_concurrent: int = 10,
     cookies: dict[str, str] | None = None,
     headers: dict[str, str] | None = None,
+    verify_tls: bool = True,
+    no_proxy: str | None = None,
 ) -> list[ProbeResult]:
     """Probe a list of URLs for authentication requirements."""
     unique_urls = list(dict.fromkeys(urls))  # deduplicate, preserve order
     semaphore = asyncio.Semaphore(max_concurrent)
     merged_headers = {"User-Agent": "ConfigExtractor/1.0", **(headers or {})}
-    session_kwargs: dict = {"headers": merged_headers}
+    # trust_env=True so aiohttp honors HTTPS_PROXY / HTTP_PROXY / NO_PROXY.
+    session_kwargs: dict = {"headers": merged_headers, "trust_env": True}
     if cookies:
         session_kwargs["cookies"] = cookies
-    async with aiohttp.ClientSession(**session_kwargs) as session:
-        tasks = [_probe_single(session, url, semaphore, timeout) for url in unique_urls]
-        return await asyncio.gather(*tasks)
+    if not verify_tls:
+        # Connector-wide disable; per-request verify_ssl= is deprecated.
+        session_kwargs["connector"] = aiohttp.TCPConnector(ssl=False)
+
+    # NOTE: process-global env mutation; safe because main() invokes probe_urls
+    # serially. If this ever becomes reentrant, wrap with a lock or thread a
+    # custom resolver instead.
+    prev_no_proxy = os.environ.get("NO_PROXY")
+    if no_proxy:
+        os.environ["NO_PROXY"] = ",".join(filter(None, [prev_no_proxy, no_proxy]))
+    try:
+        async with aiohttp.ClientSession(**session_kwargs) as session:
+            tasks = [_probe_single(session, url, semaphore, timeout) for url in unique_urls]
+            return await asyncio.gather(*tasks)
+    finally:
+        if no_proxy:
+            if prev_no_proxy is None:
+                os.environ.pop("NO_PROXY", None)
+            else:
+                os.environ["NO_PROXY"] = prev_no_proxy
 
 
 def merge_probe_results(auth_map: dict[str, AuthInfo], probes: list[ProbeResult]) -> None:
@@ -722,6 +761,48 @@ async def _probe_manifests(
 
 
 # ---------------------------------------------------------------------------
+# Playwright launch / context helpers
+# ---------------------------------------------------------------------------
+
+def _playwright_launch_kwargs(headed: bool, no_proxy: str | None) -> dict:
+    """Build chromium.launch() kwargs honoring corporate proxy env vars.
+
+    Playwright does NOT auto-read HTTPS_PROXY/HTTP_PROXY — it must be passed
+    explicitly at launch time. We also fold the caller's --no-proxy hosts into
+    the bypass list together with any NO_PROXY env entries.
+    """
+    proxy_url = (
+        os.environ.get("HTTPS_PROXY") or os.environ.get("https_proxy")
+        or os.environ.get("HTTP_PROXY") or os.environ.get("http_proxy")
+        or os.environ.get("ALL_PROXY") or os.environ.get("all_proxy")
+    )
+    launch: dict = {"headless": not headed}
+    if proxy_url:
+        env_no_proxy = os.environ.get("NO_PROXY") or os.environ.get("no_proxy") or ""
+        bypass = ",".join(
+            p.strip() for p in f"{env_no_proxy},{no_proxy or ''}".split(",") if p.strip()
+        )
+        proxy_arg: dict = {"server": proxy_url}
+        if bypass:
+            proxy_arg["bypass"] = bypass
+        launch["proxy"] = proxy_arg
+    return launch
+
+
+def _playwright_context_kwargs(insecure_tls: bool, base: dict | None = None) -> dict:
+    """Augment a base context-kwargs dict with ignore_https_errors when requested.
+
+    Chromium's trust store on Windows is best-effort and depends on enterprise
+    policy; --insecure-tls is the only reliable workaround when the corporate
+    root CA isn't honored by the bundled Chromium.
+    """
+    kwargs = dict(base or {})
+    if insecure_tls:
+        kwargs["ignore_https_errors"] = True
+    return kwargs
+
+
+# ---------------------------------------------------------------------------
 # Authentication helpers
 # ---------------------------------------------------------------------------
 
@@ -787,11 +868,19 @@ def _storage_state_to_probe_cookies(path: str, seed_url: str) -> dict[str, str]:
     return out
 
 
-async def _run_login_capture(url: str, save_path: str) -> None:
+async def _run_login_capture(
+    url: str,
+    save_path: str,
+    insecure_tls: bool = False,
+    no_proxy: str | None = None,
+) -> None:
     """Open a headed browser, wait for the user to log in, save storage state, exit."""
     async with async_playwright() as pw:
-        browser = await pw.chromium.launch(headless=False)
-        context = await browser.new_context()
+        # Login is always headed regardless of env; force it.
+        launch = _playwright_launch_kwargs(headed=True, no_proxy=no_proxy)
+        launch["headless"] = False
+        browser = await pw.chromium.launch(**launch)
+        context = await browser.new_context(**_playwright_context_kwargs(insecure_tls))
         page = await context.new_page()
         try:
             await page.goto(url)
@@ -889,6 +978,8 @@ async def crawl(
     storage_state: str | None = None,
     extra_http_headers: dict[str, str] | None = None,
     cookies: list[dict] | None = None,
+    insecure_tls: bool = False,
+    no_proxy: str | None = None,
 ) -> list[ConfigSource]:
     if isinstance(url, str):
         seeds = [url]
@@ -912,13 +1003,13 @@ async def crawl(
     seed_host = urlparse(seeds[0]).netloc
 
     async with async_playwright() as pw:
-        browser = await pw.chromium.launch(headless=not headed)
-        context_kwargs: dict = {}
+        browser = await pw.chromium.launch(**_playwright_launch_kwargs(headed, no_proxy))
+        base_ctx: dict = {}
         if storage_state:
-            context_kwargs["storage_state"] = storage_state
+            base_ctx["storage_state"] = storage_state
         if extra_http_headers:
-            context_kwargs["extra_http_headers"] = extra_http_headers
-        context = await browser.new_context(**context_kwargs)
+            base_ctx["extra_http_headers"] = extra_http_headers
+        context = await browser.new_context(**_playwright_context_kwargs(insecure_tls, base_ctx))
         if cookies:
             await context.add_cookies(cookies)
 
@@ -1099,7 +1190,7 @@ def write_results(
 # CLI
 # ---------------------------------------------------------------------------
 
-def main() -> None:
+def _build_arg_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description="Extract URLs from a web app's JSON configuration files.",
     )
@@ -1124,6 +1215,17 @@ def main() -> None:
     parser.add_argument(
         "--probe-concurrency", type=int, default=10,
         help="Max concurrent probe requests (default: 10)",
+    )
+    parser.add_argument(
+        "--insecure-tls", action="store_true",
+        help="Disable TLS certificate verification for both crawl (Playwright) "
+             "and probe (aiohttp). Use only for internal CAs that cannot be "
+             "installed in the OS trust store.",
+    )
+    parser.add_argument(
+        "--no-proxy", type=str, default=None, metavar="HOSTS",
+        help="Comma-separated hostnames/CIDRs to bypass HTTPS_PROXY/HTTP_PROXY. "
+             "Augments NO_PROXY for this run; does not modify your shell env.",
     )
     parser.add_argument(
         "--routes", type=str, default=None,
@@ -1177,10 +1279,17 @@ def main() -> None:
         "--no-manifest-probe", action="store_true",
         help="Disable probing well-known asset-manifest paths for chunks",
     )
-    args = parser.parse_args()
+    return parser
+
+
+def main() -> None:
+    args = _build_arg_parser().parse_args()
 
     if args.login:
-        asyncio.run(_run_login_capture(args.url, args.save_storage))
+        asyncio.run(_run_login_capture(
+            args.url, args.save_storage,
+            insecure_tls=args.insecure_tls, no_proxy=args.no_proxy,
+        ))
         return
 
     seeds: list[str] = [args.url]
@@ -1213,6 +1322,8 @@ def main() -> None:
         storage_state=args.storage_state,
         extra_http_headers=cli_headers or None,
         cookies=cli_cookies or None,
+        insecure_tls=args.insecure_tls,
+        no_proxy=args.no_proxy,
     ))
 
     all_urls: list[str] = []
@@ -1235,6 +1346,8 @@ def main() -> None:
             max_concurrent=args.probe_concurrency,
             cookies=probe_cookies or None,
             headers=cli_headers or None,
+            verify_tls=not args.insecure_tls,
+            no_proxy=args.no_proxy,
         ))
         merge_probe_results(auth_map, probes)
         reconcile_auth(auth_map)

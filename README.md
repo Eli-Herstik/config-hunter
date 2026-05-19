@@ -78,6 +78,25 @@ python config_extractor.py https://app.example.com --interact
 | `--storage-state PATH` | Reuse a saved Playwright session |
 | `--cookie KEY=VAL` | Set a cookie (repeatable) |
 | `--header "Name: Value"` | Set an extra header (repeatable) |
+| `--insecure-tls` | Skip TLS verification for crawl + probe (internal CAs not in OS store) |
+| `--no-proxy HOSTS` | Augment `NO_PROXY` for this run; comma-separated bypass list |
+
+### Internal-network notes
+
+config-hunter is designed to run inside your corporate network against on-prem
+targets. Two things you'll typically need to think about:
+
+- **Corporate root CA.** On Python 3.10+, the [`truststore`](https://pypi.org/project/truststore/)
+  package is auto-injected at startup so `aiohttp` validates HTTPS against the
+  **OS trust store** (Windows certificate store / macOS Keychain / Linux). If your
+  corporate root CA is already installed there, internal HTTPS targets just work.
+  When the corporate root isn't in the OS store — or when Chromium's bundled
+  trust store refuses it — use `--insecure-tls` to skip verification for both
+  the crawl and the probe pass.
+- **Corporate proxy.** `HTTPS_PROXY` / `HTTP_PROXY` / `NO_PROXY` environment
+  variables are honored automatically by both Playwright (the crawl) and aiohttp
+  (the probe). To bypass the proxy for specific internal hosts without modifying
+  your shell env, pass `--no-proxy app.intranet,*.corp.example`.
 
 ## Output
 
