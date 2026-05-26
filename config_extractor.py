@@ -932,7 +932,6 @@ async def crawl(
     max_pages: int = 1,
     same_origin_only: bool = True,
     capture_js: bool = True,
-    probe_manifests: bool = True,
     storage_state: str | None = None,
     extra_http_headers: dict[str, str] | None = None,
     cookies: list[dict] | None = None,
@@ -989,7 +988,7 @@ async def crawl(
             pages_visited += 1
 
             # Manifest probe — once, after the first page renders, against the seed origin
-            if probe_manifests and not manifest_probed and captured_js is not None:
+            if not manifest_probed and captured_js is not None:
                 manifest_probed = True
                 added = await _probe_manifests(context, seeds[0], captured_js, captured)
                 if added:
@@ -1223,10 +1222,6 @@ def main() -> None:
         "--no-capture-js", action="store_true",
         help="Disable capture/parsing of JS bodies (chunks)",
     )
-    parser.add_argument(
-        "--no-manifest-probe", action="store_true",
-        help="Disable probing well-known asset-manifest paths for chunks",
-    )
     args = parser.parse_args()
 
     if args.login:
@@ -1258,7 +1253,6 @@ def main() -> None:
         max_pages=args.max_pages,
         same_origin_only=not args.cross_origin,
         capture_js=not args.no_capture_js,
-        probe_manifests=not args.no_manifest_probe,
         storage_state=args.storage_state,
         extra_http_headers=cli_headers or None,
         cookies=cli_cookies or None,
