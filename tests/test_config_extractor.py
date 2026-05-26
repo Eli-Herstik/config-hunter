@@ -555,7 +555,7 @@ def test_write_results_quarantines_suspect_urls(tmp_path):
 
 @pytest.mark.asyncio
 async def test_default_single_url_unchanged(test_server):
-    """Without follow_links/interact, deep-route and click-only URLs must NOT appear."""
+    """Without follow_links, deep-route and lazy-chunk URLs must NOT appear."""
     sources = await crawl(
         test_server,
         timeout=10000,
@@ -565,7 +565,6 @@ async def test_default_single_url_unchanged(test_server):
     )
     all_urls = {u for s in sources for u in s.urls_found}
     assert "https://deep-page.example.com/api" not in all_urls
-    assert "https://click-triggered.example.com/api" not in all_urls
     assert "https://chunk-admin.example.com/api" not in all_urls
     assert "https://protected-api.example.com/v1" not in all_urls
 
@@ -614,12 +613,11 @@ async def test_follow_links_finds_deep_route(test_server):
 
 @pytest.mark.asyncio
 async def test_interaction_triggers_xhr(test_server):
-    """With interact=True, the click-only fetch should be captured."""
+    """The click-only fetch should be captured (interactions always run)."""
     sources = await crawl(
         test_server,
         timeout=10000,
         wait_after_load=2000,
-        interact=True,
         interact_budget_ms=6000,
     )
     all_urls = {u for s in sources for u in s.urls_found}

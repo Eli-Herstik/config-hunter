@@ -879,7 +879,6 @@ async def _crawl_one_page(
     captured_urls: set[str],
     timeout: int,
     wait_after_load: int,
-    interact: bool,
     interact_budget_ms: int,
     is_seed: bool = False,
 ) -> tuple[list[ConfigSource], list[str]]:
@@ -906,11 +905,10 @@ async def _crawl_one_page(
     if wait_after_load > 0:
         await page.wait_for_timeout(wait_after_load)
 
-    if interact:
-        print(f"  Running interactions (budget {interact_budget_ms}ms)...")
-        await _run_interactions(page, interact_budget_ms)
-        if wait_after_load > 0:
-            await page.wait_for_timeout(wait_after_load)
+    print(f"  Running interactions (budget {interact_budget_ms}ms)...")
+    await _run_interactions(page, interact_budget_ms)
+    if wait_after_load > 0:
+        await page.wait_for_timeout(wait_after_load)
 
     dom_sources = await extract_from_dom(page, captured_urls)
 
@@ -929,7 +927,6 @@ async def crawl(
     timeout: int = 30000,
     wait_after_load: int = 5000,
     headed: bool = False,
-    interact: bool = False,
     interact_budget_ms: int = 8000,
     follow_links: bool = False,
     max_pages: int = 1,
@@ -985,7 +982,6 @@ async def crawl(
                 captured_urls=captured_urls,
                 timeout=timeout,
                 wait_after_load=wait_after_load,
-                interact=interact,
                 interact_budget_ms=interact_budget_ms,
                 is_seed=(pages_visited == 0),
             )
@@ -1220,10 +1216,6 @@ def main() -> None:
         help="Allow follow-links to jump origins (default: same-origin only)",
     )
     parser.add_argument(
-        "--interact", action="store_true",
-        help="Run interaction simulation (scroll, hover, click) on each page",
-    )
-    parser.add_argument(
         "--interact-budget", type=int, default=8000,
         help="Per-page interaction budget in ms (default: 8000)",
     )
@@ -1261,7 +1253,6 @@ def main() -> None:
         timeout=args.timeout,
         wait_after_load=args.wait_after_load,
         headed=args.headed,
-        interact=args.interact,
         interact_budget_ms=args.interact_budget,
         follow_links=args.follow_links,
         max_pages=args.max_pages,

@@ -54,10 +54,9 @@ python config_extractor.py https://app.example.com \
 ```sh
 python config_extractor.py https://app.example.com --follow-links --max-pages 10
 python config_extractor.py https://app.example.com --routes routes.txt
-python config_extractor.py https://app.example.com --interact
 ```
 
-`--interact` runs a time-budgeted pass of safe scrolls, hovers, and clicks to surface lazy-loaded XHRs. Submit buttons, form descendants, and controls labeled "logout"/"delete" are skipped.
+A time-budgeted pass of safe scrolls, hovers, and clicks runs on every page to surface lazy-loaded XHRs. Submit buttons, form descendants, and controls labeled "logout"/"delete" are skipped. Tune the budget with `--interact-budget MS`.
 
 ### Selected flags
 
@@ -70,7 +69,7 @@ python config_extractor.py https://app.example.com --interact
 | `--follow-links` | Discover same-origin `a[href]` and crawl them |
 | `--max-pages N` | Cap pages visited (default 1) |
 | `--cross-origin` | Allow `--follow-links` to leave the seed origin |
-| `--interact` / `--interact-budget MS` | Simulate user interaction |
+| `--interact-budget MS` | Per-page interaction budget (default 8000) |
 | `--no-capture-js` | Skip JS chunk capture |
 | `--no-manifest-probe` | Skip well-known manifest paths |
 | `--probe-timeout S` / `--probe-concurrency N` | Tune the auth-probe pass |
