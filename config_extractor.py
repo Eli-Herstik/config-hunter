@@ -746,6 +746,14 @@ async def _probe_manifests(
         if not body or len(body) > MAX_PAYLOAD_BYTES:
             continue
 
+        # SPAs typically serve their index.html with 200 for any unknown
+        # path. Only treat the response as a manifest if it's actually JSON
+        # by content-type or by parseability.
+        ct = resp.headers.get("content-type", "").lower()
+        parsed_manifest, _ = try_parse_json(body)
+        if "json" not in ct and parsed_manifest is None:
+            continue
+
         # The manifest itself often contains URLs worth harvesting
         captured_json.append((manifest_url, body))
         print(f"  [manifest] {manifest_url}")

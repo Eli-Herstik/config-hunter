@@ -422,6 +422,16 @@ def _create_app():
     async def handle_chunk_admin(request):
         return web.Response(text=CHUNK_ADMIN_JS, content_type="application/javascript")
 
+    async def handle_spa_fallback_manifest(request):
+        # Simulates an SPA that returns index.html (200) for any unknown path,
+        # including manifest probe paths it doesn't actually serve.
+        html = (
+            '<html><body>'
+            '<img src="/assets/img/spa-fallback-image.avif">'
+            '</body></html>'
+        )
+        return web.Response(text=html, content_type="text/html")
+
     async def handle_protected_config(request):
         if request.cookies.get("session") == "abc":
             return web.Response(text=PROTECTED_CONFIG_JSON, content_type="application/json")
@@ -434,6 +444,8 @@ def _create_app():
     app.router.add_get("/api/click-only.json", handle_click_only_json)
     app.router.add_get("/not-json", handle_not_json)
     app.router.add_get("/asset-manifest.json", handle_asset_manifest)
+    # /manifest.json is in MANIFEST_PATHS; serve SPA fallback HTML here.
+    app.router.add_get("/manifest.json", handle_spa_fallback_manifest)
     app.router.add_get("/static/js/chunk-admin.js", handle_chunk_admin)
     app.router.add_get("/protected/config.json", handle_protected_config)
     return app
@@ -564,6 +576,22 @@ async def test_default_single_url_unchanged(test_server):
     all_urls = {u for s in sources for u in s.urls_found}
     assert "https://deep-page.example.com/api" not in all_urls
     assert "https://protected-api.example.com/v1" not in all_urls
+
+
+@pytest.mark.asyncio
+async def test_manifest_probe_skips_spa_html_fallback(test_server):
+    """SPA fallback (HTML body served at /manifest.json with 200) must not
+    be captured as a manifest, and its embedded asset URLs must not surface."""
+    sources = await crawl(
+        test_server,
+        timeout=10000,
+        wait_after_load=2000,
+    )
+    for src in sources:
+        assert "/manifest.json" not in src.origin
+    all_urls = {u for s in sources for u in s.urls_found}
+    spa_asset = f"{test_server}/assets/img/spa-fallback-image.avif"
+    assert spa_asset not in all_urls
 
 
 @pytest.mark.asyncio
