@@ -33,6 +33,7 @@ from config_extractor import (
     probe_urls,
     merge_probe_results,
     reconcile_auth,
+    resolve_hosts,
     _parse_www_authenticate,
     _cookies_from_kv,
     _headers_from_kv,
@@ -1169,3 +1170,99 @@ async def test_probe_urls_with_extra_header(test_server):
     results = await probe_urls([url], timeout=5.0,
                                headers={"X-Custom": "test"})
     assert results[0].status_code == 200
+
+
+# ===========================================================================
+# Part 7: DNS resolution
+# ===========================================================================
+
+# The .invalid TLD (RFC 6761) is reserved and guaranteed never to resolve.
+_BAD_HOST = "doesnotexist.invalid"
+
+
+@pytest.mark.asyncio
+async def test_resolve_hosts_returns_empty_for_resolvable():
+    result = await resolve_hosts(["localhost"])
+    assert result == []
+
+
+@pytest.mark.asyncio
+async def test_resolve_hosts_reports_nxdomain():
+    result = await resolve_hosts([_BAD_HOST])
+    assert len(result) == 1
+    assert result[0]["host"] == _BAD_HOST
+    assert result[0]["error"] == "NXDOMAIN"
+
+
+@pytest.mark.asyncio
+async def test_resolve_hosts_mixed():
+    result = await resolve_hosts(["localhost", _BAD_HOST])
+    hosts = {entry["host"] for entry in result}
+    assert hosts == {_BAD_HOST}
+
+
+@pytest.mark.asyncio
+async def test_resolve_hosts_dedupes():
+    result = await resolve_hosts([_BAD_HOST, _BAD_HOST, _BAD_HOST])
+    assert len(result) == 1
+
+
+def test_write_results_includes_unresolved_hosts(tmp_path):
+    sources = [ConfigSource(
+        origin="js: https://test/bundle.js",
+        urls_found=["https://real.example.com/api"],
+    )]
+    out = tmp_path / "r.json"
+    unresolved = [{"host": "x.invalid", "error": "NXDOMAIN"}]
+    write_results(sources, str(out), unresolved=unresolved)
+    with open(out, "r", encoding="utf-8") as f:
+        data = json.load(f)
+    assert data["unresolved_hosts"] == unresolved
+
+
+def test_write_results_omits_unresolved_when_none(tmp_path):
+    sources = [ConfigSource(
+        origin="js: https://test/bundle.js",
+        urls_found=["https://real.example.com/api"],
+    )]
+    out = tmp_path / "r.json"
+    write_results(sources, str(out))
+    with open(out, "r", encoding="utf-8") as f:
+        data = json.load(f)
+    assert "unresolved_hosts" not in data
+
+
+@pytest.mark.asyncio
+async def test_probe_filtering_skips_unresolved_hosts(test_server):
+    """End-to-end: URLs on unresolved hosts must be excluded from probe input
+    and marked 'unknown (unresolved host)' in the auth map."""
+    from urllib.parse import urlparse
+
+    good_url = f"{test_server}/config.json"
+    bad_url = f"https://{_BAD_HOST}/api"
+    unique_urls = [good_url, bad_url]
+
+    # Replicate the main() flow: resolve, filter, probe, then check auth_map.
+    auth_map = {u: AuthInfo(url=u) for u in unique_urls}
+    hosts = sorted({urlparse(u).hostname for u in unique_urls if urlparse(u).hostname})
+    unresolved = await resolve_hosts(hosts)
+    unresolved_set = {entry["host"] for entry in unresolved}
+
+    assert _BAD_HOST in unresolved_set
+    assert "127.0.0.1" not in unresolved_set
+
+    probeable = [u for u in unique_urls if urlparse(u).hostname not in unresolved_set]
+    for url in unique_urls:
+        if urlparse(url).hostname in unresolved_set:
+            auth_map[url].best_guess = "unknown (unresolved host)"
+
+    assert probeable == [good_url]
+
+    probes = await probe_urls(probeable, timeout=5.0)
+    merge_probe_results(auth_map, probes)
+    reconcile_auth(auth_map)
+
+    assert auth_map[bad_url].best_guess == "unknown (unresolved host)"
+    assert auth_map[bad_url].probe_result is None
+    assert auth_map[good_url].probe_result is not None
+    assert auth_map[good_url].probe_result.status_code == 200

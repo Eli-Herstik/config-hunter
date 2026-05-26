@@ -9,6 +9,7 @@ import argparse
 import asyncio
 import json
 import re
+import socket
 import string
 import sys
 from dataclasses import dataclass, field
@@ -196,6 +197,55 @@ def reconcile_auth(auth_map: dict[str, AuthInfo]) -> None:
         elif probe and probe.detected_method == "forbidden":
             info.best_guess = "unknown (forbidden)"
         # else: stays "unknown"
+
+
+# ---------------------------------------------------------------------------
+# DNS resolution
+# ---------------------------------------------------------------------------
+
+def _classify_dns_error(exc: BaseException) -> str:
+    if isinstance(exc, asyncio.TimeoutError):
+        return "timeout"
+    if isinstance(exc, socket.gaierror):
+        if exc.errno == socket.EAI_NONAME:
+            return "NXDOMAIN"
+        if exc.errno == socket.EAI_AGAIN:
+            return "SERVFAIL"
+        return f"gaierror: {exc.strerror or exc}"
+    return str(exc)
+
+
+async def _resolve_single(
+    host: str,
+    semaphore: asyncio.Semaphore,
+    timeout: float,
+) -> dict | None:
+    """Resolve one host; return {host, error} on failure, None on success."""
+    loop = asyncio.get_running_loop()
+    async with semaphore:
+        try:
+            await asyncio.wait_for(
+                loop.getaddrinfo(host, None),
+                timeout=timeout,
+            )
+            return None
+        except Exception as e:
+            return {"host": host, "error": _classify_dns_error(e)}
+
+
+async def resolve_hosts(
+    hosts: list[str],
+    timeout: float = 3.0,
+    max_concurrent: int = 20,
+) -> list[dict]:
+    """Resolve each host via the system resolver; return [{host, error}] for failures only."""
+    unique_hosts = list(dict.fromkeys(hosts))
+    semaphore = asyncio.Semaphore(max_concurrent)
+    tasks = [_resolve_single(h, semaphore, timeout) for h in unique_hosts]
+    results = await asyncio.gather(*tasks)
+    failures = [r for r in results if r is not None]
+    failures.sort(key=lambda r: r["host"])
+    return failures
 
 
 # ---------------------------------------------------------------------------
@@ -977,6 +1027,7 @@ async def crawl(
 def print_results(
     sources: list[ConfigSource],
     auth_map: dict[str, AuthInfo] | None = None,
+    unresolved: list[dict] | None = None,
 ) -> None:
     if not sources:
         print("\nNo JSON configurations with URLs were found.")
@@ -1034,6 +1085,9 @@ def print_results(
     if suspect_count:
         print(f"\nSuspect URLs (skipped probe): {suspect_count}")
 
+    if unresolved:
+        print(f"\nUnresolved hosts (skipped probe): {len(unresolved)}")
+
     print()
 
 
@@ -1041,6 +1095,7 @@ def write_results(
     sources: list[ConfigSource],
     path: str,
     auth_map: dict[str, AuthInfo] | None = None,
+    unresolved: list[dict] | None = None,
 ) -> None:
     all_clean: set[str] = set()
     suspect_index: dict[str, dict] = {}
@@ -1074,6 +1129,9 @@ def write_results(
         "unique_hosts": sorted(hosts),
         "suspect_urls": suspect_urls,
     }
+
+    if unresolved is not None:
+        output["unresolved_hosts"] = unresolved
 
     if auth_map:
         auth_section: dict = {}
@@ -1227,10 +1285,25 @@ def main() -> None:
     for c in cli_cookies:
         probe_cookies[c["name"]] = c["value"]
 
+    unresolved: list[dict] = []
+    probeable_urls = unique_urls
     if unique_urls:
-        print(f"Probing {len(unique_urls)} URLs for authentication methods...")
+        unique_url_hosts = sorted({urlparse(u).hostname for u in unique_urls if urlparse(u).hostname})
+        print(f"Resolving {len(unique_url_hosts)} hosts...")
+        unresolved = asyncio.run(resolve_hosts(unique_url_hosts))
+        unresolved_set = {entry["host"] for entry in unresolved}
+        if unresolved_set:
+            probeable_urls = [u for u in unique_urls if urlparse(u).hostname not in unresolved_set]
+            for url in unique_urls:
+                if urlparse(url).hostname in unresolved_set:
+                    auth_map[url].best_guess = "unknown (unresolved host)"
+
+    if probeable_urls:
+        skipped = len(unique_urls) - len(probeable_urls)
+        skip_msg = f" (skipping {skipped} on unresolved hosts)" if skipped else ""
+        print(f"Probing {len(probeable_urls)} URLs for authentication methods...{skip_msg}")
         probes = asyncio.run(probe_urls(
-            unique_urls,
+            probeable_urls,
             timeout=float(args.probe_timeout),
             max_concurrent=args.probe_concurrency,
             cookies=probe_cookies or None,
@@ -1239,10 +1312,10 @@ def main() -> None:
         merge_probe_results(auth_map, probes)
         reconcile_auth(auth_map)
 
-    print_results(sources, auth_map)
+    print_results(sources, auth_map, unresolved)
 
     if args.output:
-        write_results(sources, args.output, auth_map)
+        write_results(sources, args.output, auth_map, unresolved)
 
 
 if __name__ == "__main__":

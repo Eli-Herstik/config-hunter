@@ -81,7 +81,7 @@ python config_extractor.py https://app.example.com --interact
 
 ## Output
 
-The console report lists each config source (network response, DOM script, JS chunk), the URLs extracted from it, the unique host set, and an "Authentication Analysis" section with a per-URL probe result and verdict (`basic`, `bearer`, `negotiate`, `oauth`, `none`, `unknown`, …). With `-o`, the same data is written as JSON.
+The console report lists each config source (network response, DOM script, JS chunk), the URLs extracted from it, the unique host set, and an "Authentication Analysis" section with a per-URL probe result and verdict (`basic`, `bearer`, `negotiate`, `oauth`, `none`, `unknown`, …). With `-o`, the same data is written as JSON, including an `unresolved_hosts` array — hosts referenced in configs that failed DNS resolution from the scanner's network position (each entry has `host` and an `error` reason such as `NXDOMAIN`, `SERVFAIL`, or `timeout`). URLs on unresolved hosts are skipped during the probe pass.
 
 ## Tests
 
