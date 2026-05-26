@@ -555,16 +555,14 @@ def test_write_results_quarantines_suspect_urls(tmp_path):
 
 @pytest.mark.asyncio
 async def test_default_single_url_unchanged(test_server):
-    """Without follow_links, deep-route and lazy-chunk URLs must NOT appear."""
+    """Without follow_links, the deep route and the cookie-gated API must NOT appear."""
     sources = await crawl(
         test_server,
         timeout=10000,
         wait_after_load=2000,
-        capture_js=False,
     )
     all_urls = {u for s in sources for u in s.urls_found}
     assert "https://deep-page.example.com/api" not in all_urls
-    assert "https://chunk-admin.example.com/api" not in all_urls
     assert "https://protected-api.example.com/v1" not in all_urls
 
 
@@ -575,7 +573,6 @@ async def test_manifest_probe_finds_lazy_chunk_url(test_server):
         test_server,
         timeout=10000,
         wait_after_load=2000,
-        capture_js=True,
     )
     all_urls = {u for s in sources for u in s.urls_found}
     assert "https://chunk-admin.example.com/api" in all_urls

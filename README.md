@@ -70,7 +70,6 @@ A time-budgeted pass of safe scrolls, hovers, and clicks runs on every page to s
 | `--max-pages N` | Cap pages visited (default 1) |
 | `--cross-origin` | Allow `--follow-links` to leave the seed origin |
 | `--interact-budget MS` | Per-page interaction budget (default 8000) |
-| `--no-capture-js` | Skip JS chunk capture |
 | `--probe-timeout S` / `--probe-concurrency N` | Tune the auth-probe pass |
 | `--login` / `--save-storage PATH` | Headed manual-login capture mode |
 | `--storage-state PATH` | Reuse a saved Playwright session |

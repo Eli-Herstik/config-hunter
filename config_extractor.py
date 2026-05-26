@@ -377,7 +377,7 @@ def _exceeds_size_limit(response: Response) -> bool:
 async def capture_response(
     response: Response,
     captured_json: list[tuple[str, str]],
-    captured_js: list[tuple[str, str]] | None = None,
+    captured_js: list[tuple[str, str]],
 ) -> None:
     if response.status < 200 or response.status >= 300:
         return
@@ -385,7 +385,7 @@ async def capture_response(
         print(f"  [skip] Response too large: {response.url}", file=sys.stderr)
         return
     is_json = _is_json_response(response)
-    is_js = captured_js is not None and not is_json and _is_js_response(response)
+    is_js = not is_json and _is_js_response(response)
     if not (is_json or is_js):
         return
     try:
@@ -875,7 +875,7 @@ async def _crawl_one_page(
     context,
     url: str,
     captured: list[tuple[str, str]],
-    captured_js: list[tuple[str, str]] | None,
+    captured_js: list[tuple[str, str]],
     captured_urls: set[str],
     timeout: int,
     wait_after_load: int,
@@ -931,7 +931,6 @@ async def crawl(
     follow_links: bool = False,
     max_pages: int = 1,
     same_origin_only: bool = True,
-    capture_js: bool = True,
     storage_state: str | None = None,
     extra_http_headers: dict[str, str] | None = None,
     cookies: list[dict] | None = None,
@@ -944,7 +943,7 @@ async def crawl(
         return []
 
     captured: list[tuple[str, str]] = []
-    captured_js: list[tuple[str, str]] | None = [] if capture_js else None
+    captured_js: list[tuple[str, str]] = []
     all_dom_sources: list[ConfigSource] = []
 
     queue: list[str] = []
@@ -988,7 +987,7 @@ async def crawl(
             pages_visited += 1
 
             # Manifest probe — once, after the first page renders, against the seed origin
-            if not manifest_probed and captured_js is not None:
+            if not manifest_probed:
                 manifest_probed = True
                 added = await _probe_manifests(context, seeds[0], captured_js, captured)
                 if added:
@@ -1007,11 +1006,10 @@ async def crawl(
         await browser.close()
 
     print(f"Captured {len(captured)} JSON network responses across {pages_visited} page(s).")
-    if captured_js is not None:
-        print(f"Captured {len(captured_js)} JS bodies (chunks/manifests).")
+    print(f"Captured {len(captured_js)} JS bodies (chunks/manifests).")
 
     network_sources = process_network_captures(captured)
-    js_sources = process_js_captures(captured_js) if captured_js is not None else []
+    js_sources = process_js_captures(captured_js)
     return network_sources + js_sources + all_dom_sources
 
 
@@ -1218,10 +1216,6 @@ def main() -> None:
         "--interact-budget", type=int, default=8000,
         help="Per-page interaction budget in ms (default: 8000)",
     )
-    parser.add_argument(
-        "--no-capture-js", action="store_true",
-        help="Disable capture/parsing of JS bodies (chunks)",
-    )
     args = parser.parse_args()
 
     if args.login:
@@ -1252,7 +1246,6 @@ def main() -> None:
         follow_links=args.follow_links,
         max_pages=args.max_pages,
         same_origin_only=not args.cross_origin,
-        capture_js=not args.no_capture_js,
         storage_state=args.storage_state,
         extra_http_headers=cli_headers or None,
         cookies=cli_cookies or None,
