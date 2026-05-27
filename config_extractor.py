@@ -378,8 +378,11 @@ async def capture_response(
     response: Response,
     captured_json: list[tuple[str, str]],
     captured_js: list[tuple[str, str]],
+    seen_urls: set[str],
 ) -> None:
     if response.status < 200 or response.status >= 300:
+        return
+    if response.url in seen_urls:
         return
     if _exceeds_size_limit(response):
         print(f"  [skip] Response too large: {response.url}", file=sys.stderr)
@@ -397,6 +400,7 @@ async def capture_response(
             captured_json.append((response.url, body))
         else:
             captured_js.append((response.url, body))
+        seen_urls.add(response.url)
     except Exception:
         pass  # body unavailable (e.g. page navigated away)
 
@@ -728,14 +732,16 @@ async def _probe_manifests(
     base_url: str,
     captured_js: list[tuple[str, str]],
     captured_json: list[tuple[str, str]],
+    seen_urls: set[str],
 ) -> int:
     """Try well-known manifest paths; fetch any referenced chunks as text.
     Returns number of chunks captured."""
-    seen_chunks: set[str] = {u for u, _ in captured_js}
     chunks_added = 0
 
     for manifest_rel in MANIFEST_PATHS:
         manifest_url = urljoin(base_url, manifest_rel)
+        if manifest_url in seen_urls:
+            continue
         try:
             resp = await context.request.get(manifest_url, timeout=5000)
             if resp.status < 200 or resp.status >= 300:
@@ -756,14 +762,14 @@ async def _probe_manifests(
 
         # The manifest itself often contains URLs worth harvesting
         captured_json.append((manifest_url, body))
+        seen_urls.add(manifest_url)
         print(f"  [manifest] {manifest_url}")
 
         chunk_paths = _extract_chunk_paths_from_manifest(body)
         for chunk_path in chunk_paths:
             chunk_abs = urljoin(manifest_url, chunk_path)
-            if chunk_abs in seen_chunks:
+            if chunk_abs in seen_urls:
                 continue
-            seen_chunks.add(chunk_abs)
             try:
                 cresp = await context.request.get(chunk_abs, timeout=5000)
                 if cresp.status < 200 or cresp.status >= 300:
@@ -772,6 +778,7 @@ async def _probe_manifests(
                 if not cbody or len(cbody) > MAX_PAYLOAD_BYTES:
                     continue
                 captured_js.append((chunk_abs, cbody))
+                seen_urls.add(chunk_abs)
                 chunks_added += 1
             except Exception:
                 continue
@@ -885,6 +892,7 @@ async def _crawl_one_page(
     captured: list[tuple[str, str]],
     captured_js: list[tuple[str, str]],
     captured_urls: set[str],
+    seen_urls: set[str],
     timeout: int,
     wait_after_load: int,
     interact_budget_ms: int,
@@ -893,7 +901,7 @@ async def _crawl_one_page(
     """Visit one URL; return (dom_sources, discovered_links)."""
     page = await context.new_page()
     page.on("response", lambda resp: asyncio.ensure_future(
-        capture_response(resp, captured, captured_js)
+        capture_response(resp, captured, captured_js, seen_urls)
     ))
 
     print(f"Navigating to {url} ...")
@@ -952,6 +960,9 @@ async def crawl(
 
     captured: list[tuple[str, str]] = []
     captured_js: list[tuple[str, str]] = []
+    # Dedup set: shared across page captures and the manifest probe so the
+    # same chunk URL never appears twice in captured_js / captured_json.
+    seen_urls: set[str] = set()
     all_dom_sources: list[ConfigSource] = []
 
     queue: list[str] = []
@@ -986,6 +997,7 @@ async def crawl(
                 captured=captured,
                 captured_js=captured_js,
                 captured_urls=captured_urls,
+                seen_urls=seen_urls,
                 timeout=timeout,
                 wait_after_load=wait_after_load,
                 interact_budget_ms=interact_budget_ms,
@@ -997,7 +1009,7 @@ async def crawl(
             # Manifest probe — once, after the first page renders, against the seed origin
             if not manifest_probed:
                 manifest_probed = True
-                added = await _probe_manifests(context, seeds[0], captured_js, captured)
+                added = await _probe_manifests(context, seeds[0], captured_js, captured, seen_urls)
                 if added:
                     print(f"  [manifest] captured {added} chunk(s)")
 
