@@ -655,8 +655,8 @@ def _normalize_url(url: str) -> str:
     return f"{parsed.scheme}://{netloc}{path}{query}"
 
 
-async def _discover_links(page: Page, base_url: str, same_origin_only: bool) -> list[str]:
-    """Pull a[href] values from the page; return absolute http(s) URLs."""
+async def _discover_links(page: Page, base_url: str) -> list[str]:
+    """Pull a[href] values from the page; return absolute same-origin http(s) URLs."""
     try:
         hrefs = await page.eval_on_selector_all(
             "a[href]", "els => els.map(e => e.getAttribute('href'))"
@@ -674,7 +674,7 @@ async def _discover_links(page: Page, base_url: str, same_origin_only: bool) -> 
         parsed = urlparse(abs_url)
         if parsed.scheme not in ("http", "https"):
             continue
-        if same_origin_only and parsed.netloc != base_host:
+        if parsed.netloc != base_host:
             continue
         out.append(abs_url)
     return out
@@ -930,7 +930,7 @@ async def _crawl_one_page(
 
     discovered: list[str] = []
     try:
-        discovered = await _discover_links(page, page.url, same_origin_only=True)
+        discovered = await _discover_links(page, page.url)
     except Exception:
         pass
 
@@ -946,7 +946,6 @@ async def crawl(
     interact_budget_ms: int = 8000,
     follow_links: bool = False,
     max_pages: int = 1,
-    same_origin_only: bool = True,
     storage_state: str | None = None,
     extra_http_headers: dict[str, str] | None = None,
     cookies: list[dict] | None = None,
@@ -972,8 +971,6 @@ async def crawl(
         if norm not in visited:
             visited.add(norm)
             queue.append(s)
-
-    seed_host = urlparse(seeds[0]).netloc
 
     async with async_playwright() as pw:
         browser = await pw.chromium.launch(headless=not headed)
@@ -1015,8 +1012,6 @@ async def crawl(
 
             if follow_links and pages_visited < max_pages:
                 for link in discovered:
-                    if same_origin_only and urlparse(link).netloc != seed_host:
-                        continue
                     norm = _normalize_url(link)
                     if norm in visited:
                         continue
@@ -1229,10 +1224,6 @@ def main() -> None:
         help="Cap pages visited (default: 1, single-URL behaviour)",
     )
     parser.add_argument(
-        "--cross-origin", action="store_true",
-        help="Allow follow-links to jump origins (default: same-origin only)",
-    )
-    parser.add_argument(
         "--interact-budget", type=int, default=8000,
         help="Per-page interaction budget in ms (default: 8000)",
     )
@@ -1265,7 +1256,6 @@ def main() -> None:
         interact_budget_ms=args.interact_budget,
         follow_links=args.follow_links,
         max_pages=args.max_pages,
-        same_origin_only=not args.cross_origin,
         storage_state=args.storage_state,
         extra_http_headers=cli_headers or None,
         cookies=cli_cookies or None,
