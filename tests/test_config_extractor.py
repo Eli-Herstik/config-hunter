@@ -35,6 +35,7 @@ from config_extractor import (
     reconcile_auth,
     resolve_hosts,
     _parse_www_authenticate,
+    _classify_probe,
     _cookies_from_kv,
     _headers_from_kv,
     _storage_state_to_probe_cookies,
@@ -655,6 +656,29 @@ class TestParseWwwAuthenticate:
         assert _parse_www_authenticate("") == "unknown"
 
 
+class TestClassifyProbe:
+    def test_401_with_basic(self):
+        assert _classify_probe(401, 'Basic realm="x"') == "basic"
+
+    def test_401_without_header(self):
+        assert _classify_probe(401, None) == "unknown"
+
+    def test_403_with_bearer_challenge(self):
+        # RFC 6750 insufficient_scope: 403 carries a Bearer challenge, which
+        # must win over the opaque "forbidden" classification.
+        assert _classify_probe(403, 'Bearer error="insufficient_scope"') == "bearer"
+
+    def test_403_without_header(self):
+        assert _classify_probe(403, None) == "forbidden"
+
+    def test_200_with_header(self):
+        # A challenge on any status is authoritative (RFC 7235 §4.1 MAY clause).
+        assert _classify_probe(200, "Negotiate") == "negotiate"
+
+    def test_200_without_header(self):
+        assert _classify_probe(200, None) == "none"
+
+
 class TestReconcileAuth:
     def test_probe_www_authenticate_wins(self):
         auth_map = {
@@ -706,7 +730,7 @@ class TestReconcileAuth:
             ),
         }
         reconcile_auth(auth_map)
-        assert auth_map["https://api.example.com"].best_guess == "unknown (forbidden)"
+        assert auth_map["https://api.example.com"].best_guess == "forbidden"
 
 
 # ===========================================================================
@@ -776,6 +800,14 @@ def _create_auth_app():
     async def handle_forbidden(request):
         return web.Response(status=403, text="Forbidden")
 
+    async def handle_forbidden_bearer(request):
+        # RFC 6750 insufficient_scope: valid token, missing scope -> 403 + challenge.
+        return web.Response(
+            status=403,
+            headers={"WWW-Authenticate": 'Bearer error="insufficient_scope", scope="admin"'},
+            text="Forbidden",
+        )
+
     async def handle_bad_request(request):
         return web.Response(status=400, text="Bad Request")
 
@@ -809,6 +841,7 @@ def _create_auth_app():
     app.router.add_get("/auth/bearer", handle_bearer_auth)
     app.router.add_get("/auth/none", handle_no_auth)
     app.router.add_get("/auth/forbidden", handle_forbidden)
+    app.router.add_get("/auth/forbidden-bearer", handle_forbidden_bearer)
     app.router.add_get("/auth/bad-request", handle_bad_request)
     app.router.add_get("/auth/not-found", handle_not_found)
     app.router.add_get("/auth/redirect", handle_redirect)
@@ -821,6 +854,7 @@ def _create_auth_app():
     app.router.add_route("HEAD", "/auth/bearer", handle_bearer_auth)
     app.router.add_route("HEAD", "/auth/none", handle_no_auth)
     app.router.add_route("HEAD", "/auth/forbidden", handle_forbidden)
+    app.router.add_route("HEAD", "/auth/forbidden-bearer", handle_forbidden_bearer)
     app.router.add_route("HEAD", "/auth/bad-request", handle_bad_request)
     app.router.add_route("HEAD", "/auth/not-found", handle_not_found)
     app.router.add_route("HEAD", "/auth/redirect", handle_redirect)
@@ -900,6 +934,18 @@ async def test_probe_forbidden_with_fallback(auth_server):
     # Fallback to host root which returns 200
     assert results[0].status_code == 200
     assert results[0].detected_method == "none"
+
+
+@pytest.mark.asyncio
+async def test_probe_forbidden_with_bearer_challenge(auth_server):
+    """403 carrying a Bearer challenge (RFC 6750 insufficient_scope) must keep
+    that challenge — the root fallback must NOT overwrite it with the host
+    root's 200/none."""
+    results = await probe_urls([f"{auth_server}/auth/forbidden-bearer"], timeout=5.0)
+    assert len(results) == 1
+    assert results[0].status_code == 403
+    assert results[0].detected_method == "bearer"
+    assert results[0].www_authenticate is not None
 
 
 @pytest.mark.asyncio

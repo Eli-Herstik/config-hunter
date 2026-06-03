@@ -56,7 +56,7 @@ class AuthInfo:
 def _parse_www_authenticate(header: str) -> str:
     """Extract the auth scheme from a WWW-Authenticate header value."""
     scheme = header.strip().split()[0].lower() if header else ""
-    mapping = {"basic": "basic", "bearer": "bearer", "negotiate": "negotiate", "ntlm": "negotiate"}
+    mapping = {"basic": "basic", "bearer": "bearer", "negotiate": "negotiate", "ntlm": "ntlm"}
     return mapping.get(scheme, scheme or "unknown")
 
 
@@ -89,8 +89,13 @@ async def _do_probe_request(
 
 def _classify_probe(status: int, www_auth: str | None, location: str = "") -> str:
     """Classify a probe response into a detected auth method string."""
+    # A WWW-Authenticate challenge is authoritative on any status, not just
+    # 401. RFC 6750 (OAuth Bearer) returns it on 403 for insufficient_scope,
+    # and the header MAY appear on other statuses per RFC 7235 §4.1.
+    if www_auth:
+        return _parse_www_authenticate(www_auth)
     if status == 401:
-        return _parse_www_authenticate(www_auth) if www_auth else "unknown"
+        return "unknown"
     if status == 403:
         return "forbidden"
     if 200 <= status < 300:
@@ -124,8 +129,11 @@ async def _probe_single(
 
             # On 400/403/404, the specific path may not work or may block
             # unauthenticated requests — the host root can still reveal
-            # the service's auth requirements more clearly
-            if status in (400, 403, 404):
+            # the service's auth requirements more clearly. But if the path
+            # itself returned a WWW-Authenticate challenge, that's already the
+            # authoritative answer (e.g. OAuth 403 insufficient_scope) and the
+            # root probe would only overwrite it with a weaker signal.
+            if status in (400, 403, 404) and not www_auth:
                 root = _host_root_url(url)
                 if root:
                     try:
@@ -192,10 +200,8 @@ def reconcile_auth(auth_map: dict[str, AuthInfo]) -> None:
             info.best_guess = _parse_www_authenticate(probe.www_authenticate)
         elif probe and probe.status_code and 200 <= probe.status_code < 300:
             info.best_guess = "none"
-        elif probe and probe.detected_method and probe.detected_method not in ("unknown", "forbidden", None):
+        elif probe and probe.detected_method and probe.detected_method not in ("unknown", None):
             info.best_guess = probe.detected_method
-        elif probe and probe.detected_method == "forbidden":
-            info.best_guess = "unknown (forbidden)"
         # else: stays "unknown"
 
 
