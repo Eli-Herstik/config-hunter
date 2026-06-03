@@ -32,7 +32,6 @@ from config_extractor import (
     _host_root_url,
     probe_urls,
     merge_probe_results,
-    reconcile_auth,
     resolve_hosts,
     _parse_www_authenticate,
     _classify_probe,
@@ -679,60 +678,6 @@ class TestClassifyProbe:
         assert _classify_probe(200, None) == "none"
 
 
-class TestReconcileAuth:
-    def test_probe_www_authenticate_wins(self):
-        auth_map = {
-            "https://api.example.com": AuthInfo(
-                url="https://api.example.com",
-                probe_result=ProbeResult(
-                    url="https://api.example.com",
-                    status_code=401,
-                    www_authenticate="Bearer",
-                    detected_method="bearer",
-                ),
-            ),
-        }
-        reconcile_auth(auth_map)
-        assert auth_map["https://api.example.com"].best_guess == "bearer"
-
-    def test_probe_200_means_no_auth(self):
-        auth_map = {
-            "https://cdn.example.com": AuthInfo(
-                url="https://cdn.example.com",
-                probe_result=ProbeResult(
-                    url="https://cdn.example.com",
-                    status_code=200,
-                    www_authenticate=None,
-                    detected_method="none",
-                ),
-            ),
-        }
-        reconcile_auth(auth_map)
-        assert auth_map["https://cdn.example.com"].best_guess == "none"
-
-    def test_no_info_stays_unknown(self):
-        auth_map = {
-            "https://api.example.com": AuthInfo(url="https://api.example.com"),
-        }
-        reconcile_auth(auth_map)
-        assert auth_map["https://api.example.com"].best_guess == "unknown"
-
-    def test_forbidden(self):
-        auth_map = {
-            "https://api.example.com": AuthInfo(
-                url="https://api.example.com",
-                probe_result=ProbeResult(
-                    url="https://api.example.com",
-                    status_code=403,
-                    www_authenticate=None,
-                    detected_method="forbidden",
-                ),
-            ),
-        }
-        reconcile_auth(auth_map)
-        assert auth_map["https://api.example.com"].best_guess == "forbidden"
-
-
 # ===========================================================================
 # Part 5: Auth Detection — Probing Integration Tests
 # ===========================================================================
@@ -1050,7 +995,6 @@ async def test_write_results_with_auth(auth_server, tmp_path):
     auth_map = {u: AuthInfo(url=u) for u in all_urls}
     probes = await probe_urls(all_urls, timeout=5.0)
     merge_probe_results(auth_map, probes)
-    reconcile_auth(auth_map)
 
     out_path = str(tmp_path / "results_auth.json")
     write_results(sources, out_path, auth_map)
@@ -1061,7 +1005,8 @@ async def test_write_results_with_auth(auth_server, tmp_path):
     assert "auth" in data
     assert isinstance(data["auth"], dict)
     for url, auth_entry in data["auth"].items():
-        assert "best_guess" in auth_entry
+        assert "probe" in auth_entry
+        assert "detected_method" in auth_entry["probe"]
 
 
 # ===========================================================================
@@ -1288,7 +1233,7 @@ def test_write_results_omits_unresolved_when_none(tmp_path):
 @pytest.mark.asyncio
 async def test_probe_filtering_skips_unresolved_hosts(test_server):
     """End-to-end: URLs on unresolved hosts must be excluded from probe input
-    and marked 'unknown (unresolved host)' in the auth map."""
+    and from the auth map (they're reported via the unresolved list instead)."""
     from urllib.parse import urlparse
 
     good_url = f"{test_server}/config.json"
@@ -1307,15 +1252,13 @@ async def test_probe_filtering_skips_unresolved_hosts(test_server):
     probeable = [u for u in unique_urls if urlparse(u).hostname not in unresolved_set]
     for url in unique_urls:
         if urlparse(url).hostname in unresolved_set:
-            auth_map[url].best_guess = "unknown (unresolved host)"
+            del auth_map[url]
 
     assert probeable == [good_url]
 
     probes = await probe_urls(probeable, timeout=5.0)
     merge_probe_results(auth_map, probes)
-    reconcile_auth(auth_map)
 
-    assert auth_map[bad_url].best_guess == "unknown (unresolved host)"
-    assert auth_map[bad_url].probe_result is None
+    assert bad_url not in auth_map
     assert auth_map[good_url].probe_result is not None
     assert auth_map[good_url].probe_result.status_code == 200

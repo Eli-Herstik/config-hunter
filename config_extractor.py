@@ -46,7 +46,6 @@ class AuthInfo:
     """Auth info for a single URL, derived from HTTP probing."""
     url: str
     probe_result: ProbeResult | None = None
-    best_guess: str = "unknown"
 
 
 # ---------------------------------------------------------------------------
@@ -190,19 +189,6 @@ def merge_probe_results(auth_map: dict[str, AuthInfo], probes: list[ProbeResult]
     for probe in probes:
         if probe.url in auth_map:
             auth_map[probe.url].probe_result = probe
-
-
-def reconcile_auth(auth_map: dict[str, AuthInfo]) -> None:
-    """Set best_guess on each AuthInfo from its probe result."""
-    for info in auth_map.values():
-        probe = info.probe_result
-        if probe and probe.www_authenticate:
-            info.best_guess = _parse_www_authenticate(probe.www_authenticate)
-        elif probe and probe.status_code and 200 <= probe.status_code < 300:
-            info.best_guess = "none"
-        elif probe and probe.detected_method and probe.detected_method not in ("unknown", None):
-            info.best_guess = probe.detected_method
-        # else: stays "unknown"
 
 
 # ---------------------------------------------------------------------------
@@ -1084,16 +1070,17 @@ def print_results(
         for url in sorted(auth_map):
             info = auth_map[url]
             print(f"\n  {url}")
+            verdict = "unknown"
             if info.probe_result:
                 probe = info.probe_result
+                verdict = probe.detected_method or "unknown"
                 if probe.error:
                     print(f"    Probe:   error — {probe.error}")
                 elif probe.www_authenticate:
                     print(f"    Probe:   {probe.status_code} — WWW-Authenticate: {probe.www_authenticate}")
                 else:
-                    label = probe.detected_method or "unknown"
-                    print(f"    Probe:   {probe.status_code} — {label}")
-            print(f"    Verdict: {info.best_guess}")
+                    print(f"    Probe:   {probe.status_code} — {verdict}")
+            print(f"    Verdict: {verdict}")
         print(f"\n{'=' * 70}")
 
     if suspect_count:
@@ -1150,7 +1137,7 @@ def write_results(
     if auth_map:
         auth_section: dict = {}
         for url, info in sorted(auth_map.items()):
-            entry: dict = {"best_guess": info.best_guess}
+            entry: dict = {}
             if info.probe_result:
                 p = info.probe_result
                 entry["probe"] = {
@@ -1271,7 +1258,6 @@ def main() -> None:
     for src in sources:
         all_urls.extend(src.urls_found)
     unique_urls = [u for u in dict.fromkeys(all_urls) if _classify_url(u) is None]
-    auth_map: dict[str, AuthInfo] = {url: AuthInfo(url=url) for url in unique_urls}
 
     probe_cookies: dict[str, str] = {}
     if args.storage_state:
@@ -1288,9 +1274,8 @@ def main() -> None:
         unresolved_set = {entry["host"] for entry in unresolved}
         if unresolved_set:
             probeable_urls = [u for u in unique_urls if urlparse(u).hostname not in unresolved_set]
-            for url in unique_urls:
-                if urlparse(url).hostname in unresolved_set:
-                    auth_map[url].best_guess = "unknown (unresolved host)"
+
+    auth_map: dict[str, AuthInfo] = {url: AuthInfo(url=url) for url in probeable_urls}
 
     if probeable_urls:
         skipped = len(unique_urls) - len(probeable_urls)
@@ -1304,7 +1289,6 @@ def main() -> None:
             headers=cli_headers or None,
         ))
         merge_probe_results(auth_map, probes)
-        reconcile_auth(auth_map)
 
     print_results(sources, auth_map, unresolved)
 
