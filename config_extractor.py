@@ -86,7 +86,8 @@ async def _do_probe_request(
         return status, resp.headers.get("WWW-Authenticate"), resp.headers.get("Location", "")
 
 
-def _classify_probe(status: int, www_auth: str | None, location: str = "") -> str:
+def _classify_probe(status: int, www_auth: str | None, location: str = "",
+                    url: str = "") -> str:
     """Classify a probe response into a detected auth method string."""
     # A WWW-Authenticate challenge is authoritative on any status, not just
     # 401. RFC 6750 (OAuth Bearer) returns it on 403 for insufficient_scope,
@@ -100,8 +101,21 @@ def _classify_probe(status: int, www_auth: str | None, location: str = "") -> st
     if 200 <= status < 300:
         return "none"
     if 300 <= status < 400:
-        if any(kw in location.lower() for kw in ("oauth", "authorize", "login", "auth")):
-            return "oauth"
+        has_keyword = any(kw in location.lower()
+                          for kw in ("oauth", "authorize", "login", "auth"))
+        # Compare the redirect target's host to the probed host. A federated
+        # SSO/OAuth flow points off-host (login.microsoftonline.com, an ADFS
+        # box, sso.corp.local); a local form-login points back at the same
+        # origin. Resolve first — servers commonly send a relative Location
+        # like "/login", whose hostname is empty until joined with the URL.
+        target = urljoin(url, location) if location else ""
+        target_host = (urlparse(target).hostname or "").lower()
+        probed_host = (urlparse(url).hostname or "").lower()
+        off_host = bool(target_host) and target_host != probed_host
+        if has_keyword:
+            return "oauth" if off_host else "login_redirect"
+        if off_host:
+            return "external_redirect"
         return "redirect"
     if status == 400:
         return "bad_request"
@@ -124,7 +138,7 @@ async def _probe_single(
     async with semaphore:
         try:
             status, www_auth, location = await _do_probe_request(session, url, timeout)
-            method = _classify_probe(status, www_auth, location)
+            method = _classify_probe(status, www_auth, location, url)
 
             # On 400/403/404, the specific path may not work or may block
             # unauthenticated requests — the host root can still reveal
@@ -137,7 +151,7 @@ async def _probe_single(
                 if root:
                     try:
                         root_status, root_www_auth, root_location = await _do_probe_request(session, root, timeout)
-                        root_method = _classify_probe(root_status, root_www_auth, root_location)
+                        root_method = _classify_probe(root_status, root_www_auth, root_location, root)
                         # Use root result if it reveals auth info
                         if root_method not in ("bad_request", "forbidden", "not_found", "server_error", "unknown"):
                             return ProbeResult(

@@ -677,6 +677,58 @@ class TestClassifyProbe:
     def test_200_without_header(self):
         assert _classify_probe(200, None) == "none"
 
+    def test_3xx_offhost_with_keyword_is_oauth(self):
+        # Redirect off-host to an IdP whose URL carries an auth keyword:
+        # federated SSO/OAuth, the strongest signal.
+        assert _classify_probe(
+            302, None,
+            "https://login.microsoftonline.com/authorize?client_id=x",
+            "https://app.example.com/api",
+        ) == "oauth"
+
+    def test_3xx_samehost_with_keyword_is_login_redirect(self):
+        # Same-origin redirect to a login path is local form auth, not OAuth.
+        assert _classify_probe(
+            302, None,
+            "https://app.example.com/login",
+            "https://app.example.com/dashboard",
+        ) == "login_redirect"
+
+    def test_3xx_relative_location_with_keyword_is_login_redirect(self):
+        # A relative "Location: /login" resolves to the same host once joined.
+        assert _classify_probe(
+            302, None, "/login", "https://app.example.com/dashboard",
+        ) == "login_redirect"
+
+    def test_3xx_offhost_without_keyword_is_external_redirect(self):
+        # Off-host redirect with no auth hint is still worth flagging as a
+        # cross-origin dependency, distinct from a plain same-host redirect.
+        assert _classify_probe(
+            302, None,
+            "https://cdn.othercorp.com/assets",
+            "https://app.example.com/static",
+        ) == "external_redirect"
+
+    def test_3xx_samehost_without_keyword_is_redirect(self):
+        assert _classify_probe(
+            302, None,
+            "https://app.example.com/new-path",
+            "https://app.example.com/old-path",
+        ) == "redirect"
+
+    def test_3xx_relative_location_without_keyword_is_redirect(self):
+        assert _classify_probe(
+            302, None, "/new-path", "https://app.example.com/old-path",
+        ) == "redirect"
+
+    def test_3xx_host_comparison_is_case_insensitive(self):
+        # Differing host casing must not be mistaken for an off-host redirect.
+        assert _classify_probe(
+            302, None,
+            "https://APP.example.com/new-path",
+            "https://app.example.com/old-path",
+        ) == "redirect"
+
 
 # ===========================================================================
 # Part 5: Auth Detection — Probing Integration Tests
@@ -765,6 +817,11 @@ def _create_auth_app():
     async def handle_redirect_to_login(request):
         return web.Response(status=302, headers={"Location": "/oauth/authorize?client_id=abc"})
 
+    async def handle_redirect_to_idp(request):
+        return web.Response(status=302, headers={
+            "Location": "https://login.microsoftonline.com/authorize?client_id=abc"
+        })
+
     async def handle_server_error(request):
         return web.Response(status=500, text="Internal Server Error")
 
@@ -791,6 +848,7 @@ def _create_auth_app():
     app.router.add_get("/auth/not-found", handle_not_found)
     app.router.add_get("/auth/redirect", handle_redirect)
     app.router.add_get("/auth/redirect-login", handle_redirect_to_login)
+    app.router.add_get("/auth/redirect-idp", handle_redirect_to_idp)
     app.router.add_get("/auth/server-error", handle_server_error)
     app.router.add_get("/api-gated/v1/data", handle_bad_request_subpath)
     app.router.add_get("/api-gated/", handle_api_root)
@@ -804,6 +862,7 @@ def _create_auth_app():
     app.router.add_route("HEAD", "/auth/not-found", handle_not_found)
     app.router.add_route("HEAD", "/auth/redirect", handle_redirect)
     app.router.add_route("HEAD", "/auth/redirect-login", handle_redirect_to_login)
+    app.router.add_route("HEAD", "/auth/redirect-idp", handle_redirect_to_idp)
     app.router.add_route("HEAD", "/auth/server-error", handle_server_error)
     app.router.add_route("HEAD", "/api-gated/v1/data", handle_bad_request_subpath)
     app.router.add_route("HEAD", "/api-gated/", handle_api_root)
@@ -938,7 +997,17 @@ async def test_probe_redirect(auth_server):
 
 @pytest.mark.asyncio
 async def test_probe_redirect_to_login(auth_server):
+    # Relative, same-host redirect to a login path: local form auth.
     results = await probe_urls([f"{auth_server}/auth/redirect-login"], timeout=5.0)
+    assert len(results) == 1
+    assert results[0].status_code == 302
+    assert results[0].detected_method == "login_redirect"
+
+
+@pytest.mark.asyncio
+async def test_probe_redirect_to_idp(auth_server):
+    # Off-host redirect to an external IdP: federated SSO/OAuth.
+    results = await probe_urls([f"{auth_server}/auth/redirect-idp"], timeout=5.0)
     assert len(results) == 1
     assert results[0].status_code == 302
     assert results[0].detected_method == "oauth"
