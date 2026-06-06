@@ -1103,77 +1103,6 @@ async def crawl(
 # Reporting
 # ---------------------------------------------------------------------------
 
-def print_results(
-    sources: list[ConfigSource],
-    auth_map: dict[str, AuthInfo] | None = None,
-    unresolved: list[dict] | None = None,
-) -> None:
-    if not sources:
-        print("\nNo JSON configurations with URLs were found.")
-        return
-
-    all_clean: set[str] = set()
-    suspect_count = 0
-    print(f"\n{'=' * 70}")
-    for src in sources:
-        clean, suspect = _partition_urls(src.urls_found)
-        suspect_count += len(suspect)
-        print(f"\n  Source: {src.origin}")
-        if src.error:
-            print(f"  (JSON parse error — used regex fallback: {src.error})")
-        print(f"  URLs found: {len(clean)}")
-        for u in clean:
-            print(f"    {u}")
-            all_clean.add(u)
-    hosts: set[str] = set()
-    for u in all_clean:
-        host = urlparse(u).hostname
-        if host:
-            hosts.add(host)
-    sorted_hosts = sorted(hosts)
-
-    print(f"\n{'=' * 70}")
-    print(f"Total config sources: {len(sources)}")
-    print(f"Total unique URLs:    {len(all_clean)}")
-    if sorted_hosts:
-        print(f"\nUnique hosts ({len(sorted_hosts)}):")
-        for h in sorted_hosts:
-            print(f"    {h}")
-    print(f"{'=' * 70}")
-
-    # Auth analysis section
-    if auth_map:
-        print(f"\n{'=' * 70}")
-        print("Authentication Analysis")
-        print(f"{'=' * 70}")
-        for url in sorted(auth_map):
-            info = auth_map[url]
-            print(f"\n  {url}")
-            verdict = "unknown"
-            note = None
-            if info.probe_result:
-                probe = info.probe_result
-                verdict = probe.detected_method or "unknown"
-                note = probe.note
-                if probe.error:
-                    print(f"    Probe:   error — {probe.error}")
-                elif probe.www_authenticate:
-                    print(f"    Probe:   {probe.status_code} — WWW-Authenticate: {probe.www_authenticate}")
-                else:
-                    print(f"    Probe:   {probe.status_code} — {verdict}")
-            print(f"    Verdict: {verdict}")
-            if note:
-                print(f"    Note:    {note}")
-        print(f"\n{'=' * 70}")
-
-    if suspect_count:
-        print(f"\nSuspect URLs (skipped probe): {suspect_count}")
-
-    if unresolved:
-        print(f"\nUnresolved hosts (skipped probe): {len(unresolved)}")
-
-    print()
-
 
 def write_results(
     sources: list[ConfigSource],
@@ -1373,8 +1302,6 @@ def main() -> None:
             headers=cli_headers or None,
         ))
         merge_probe_results(auth_map, probes)
-
-    print_results(sources, auth_map, unresolved)
 
     if args.output:
         write_results(sources, args.output, auth_map, unresolved)
