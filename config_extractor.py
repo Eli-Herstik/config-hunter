@@ -37,7 +37,17 @@ class ProbeResult:
     url: str
     status_code: int | None
     www_authenticate: str | None
-    detected_method: str | None  # "basic" | "bearer" | "negotiate" | "none" | "unknown" | "forbidden"
+    # Auth verdict only: "basic" | "bearer" | "negotiate" | "ntlm" (or another
+    # challenge scheme) | "oauth" | "login_redirect" | "none" | "unknown".
+    # None on transport error (see `error`).
+    detected_method: str | None
+    # Short human-readable context, set only when the verdict is inconclusive
+    # or worth flagging — e.g. "forbidden (403)", "not found (404)",
+    # "server error: 503 Service Unavailable", "proxy authentication required
+    # (407)", "redirects off-origin to sso.corp.local". None when a method was
+    # identified. Distinct from `error`, which is reserved for transport
+    # failures (a 5xx is a successful HTTP transaction, so it lands here).
+    note: str | None = None
     error: str | None = None
 
 
@@ -72,8 +82,9 @@ async def _do_probe_request(
     session: aiohttp.ClientSession,
     url: str,
     timeout: float,
-) -> tuple[int, str | None, str]:
-    """Make a HEAD (or GET fallback) request. Return (status_code, www_authenticate, location)."""
+) -> tuple[int, str | None, str, str]:
+    """Make a HEAD (or GET fallback) request.
+    Return (status_code, www_authenticate, location, reason_phrase)."""
     async with session.head(url, timeout=aiohttp.ClientTimeout(total=timeout),
                             allow_redirects=False) as resp:
         status = resp.status
@@ -82,50 +93,74 @@ async def _do_probe_request(
                                    allow_redirects=False) as resp2:
                 return (resp2.status,
                         resp2.headers.get("WWW-Authenticate"),
-                        resp2.headers.get("Location", ""))
-        return status, resp.headers.get("WWW-Authenticate"), resp.headers.get("Location", "")
+                        resp2.headers.get("Location", ""),
+                        resp2.reason or "")
+        return (status,
+                resp.headers.get("WWW-Authenticate"),
+                resp.headers.get("Location", ""),
+                resp.reason or "")
+
+
+def _classify_redirect(location: str, url: str) -> tuple[str, str | None]:
+    """Sub-classify a 3xx response into (detected_method, note).
+
+    An auth-flagged redirect is a real auth verdict (oauth / login_redirect);
+    a plain route change is not a method, so it returns "unknown" with a note
+    describing where it points."""
+    if not location:
+        return "unknown", "redirect (no Location header)"
+    has_keyword = any(kw in location.lower()
+                      for kw in ("oauth", "authorize", "login", "auth"))
+    # Compare the redirect target's host to the probed host. A federated
+    # SSO/OAuth flow points off-host (login.microsoftonline.com, an ADFS
+    # box, sso.corp.local); a local form-login points back at the same
+    # origin. Resolve first — servers commonly send a relative Location
+    # like "/login", whose hostname is empty until joined with the URL.
+    target = urljoin(url, location)
+    target_host = (urlparse(target).hostname or "").lower()
+    probed_host = (urlparse(url).hostname or "").lower()
+    off_host = bool(target_host) and target_host != probed_host
+    if has_keyword:
+        return ("oauth", None) if off_host else ("login_redirect", None)
+    if off_host:
+        return "unknown", f"redirects off-origin to {target_host}"
+    return "unknown", f"redirects to {target}"
 
 
 def _classify_probe(status: int, www_auth: str | None, location: str = "",
-                    url: str = "") -> str:
-    """Classify a probe response into a detected auth method string."""
+                    url: str = "", reason: str = "") -> tuple[str, str | None]:
+    """Classify a probe response into (detected_method, note).
+
+    detected_method is an auth verdict only — a challenge scheme ("basic",
+    "bearer", "negotiate", "ntlm", ...), "oauth", "login_redirect", "none",
+    or "unknown". note is a short human-readable string set only when the
+    method is inconclusive or worth flagging (why we couldn't pin a method, or
+    a heads-up like a proxy / off-origin redirect); it is None otherwise."""
     # A WWW-Authenticate challenge is authoritative on any status, not just
     # 401. RFC 6750 (OAuth Bearer) returns it on 403 for insufficient_scope,
     # and the header MAY appear on other statuses per RFC 7235 §4.1.
     if www_auth:
-        return _parse_www_authenticate(www_auth)
+        return _parse_www_authenticate(www_auth), None
     if status == 401:
-        return "unknown"
+        # Auth is required, but the server didn't disclose the scheme.
+        return "unknown", "auth required, scheme undisclosed"
     if status == 403:
-        return "forbidden"
+        return "unknown", "forbidden (403)"
     if 200 <= status < 300:
-        return "none"
+        return "none", None
     if 300 <= status < 400:
-        has_keyword = any(kw in location.lower()
-                          for kw in ("oauth", "authorize", "login", "auth"))
-        # Compare the redirect target's host to the probed host. A federated
-        # SSO/OAuth flow points off-host (login.microsoftonline.com, an ADFS
-        # box, sso.corp.local); a local form-login points back at the same
-        # origin. Resolve first — servers commonly send a relative Location
-        # like "/login", whose hostname is empty until joined with the URL.
-        target = urljoin(url, location) if location else ""
-        target_host = (urlparse(target).hostname or "").lower()
-        probed_host = (urlparse(url).hostname or "").lower()
-        off_host = bool(target_host) and target_host != probed_host
-        if has_keyword:
-            return "oauth" if off_host else "login_redirect"
-        if off_host:
-            return "external_redirect"
-        return "redirect"
+        return _classify_redirect(location, url)
     if status == 400:
-        return "bad_request"
+        return "unknown", "bad request (400)"
     if status == 404:
-        return "not_found"
+        return "unknown", "not found (404)"
     if status == 407:
-        return "proxy_auth"
+        return "unknown", "proxy authentication required (407)"
     if 500 <= status < 600:
-        return "server_error"
-    return "unknown"
+        detail = f"{status} {reason}".strip()
+        return "unknown", f"server error: {detail}"
+    detail = f"{status} {reason}".strip()
+    return "unknown", f"unexpected status {detail}"
 
 
 async def _probe_single(
@@ -137,8 +172,8 @@ async def _probe_single(
     """Probe a single URL for auth requirements."""
     async with semaphore:
         try:
-            status, www_auth, location = await _do_probe_request(session, url, timeout)
-            method = _classify_probe(status, www_auth, location, url)
+            status, www_auth, location, reason = await _do_probe_request(session, url, timeout)
+            method, note = _classify_probe(status, www_auth, location, url, reason)
 
             # On 400/403/404, the specific path may not work or may block
             # unauthenticated requests — the host root can still reveal
@@ -150,15 +185,18 @@ async def _probe_single(
                 root = _host_root_url(url)
                 if root:
                     try:
-                        root_status, root_www_auth, root_location = await _do_probe_request(session, root, timeout)
-                        root_method = _classify_probe(root_status, root_www_auth, root_location, root)
-                        # Use root result if it reveals auth info
-                        if root_method not in ("bad_request", "forbidden", "not_found", "server_error", "unknown"):
+                        root_status, root_www_auth, root_location, root_reason = await _do_probe_request(session, root, timeout)
+                        root_method, root_note = _classify_probe(root_status, root_www_auth, root_location, root, root_reason)
+                        # Use the root result only if it actually identified an
+                        # auth method. An "unknown" root tells us nothing the
+                        # path's own outcome didn't already.
+                        if root_method != "unknown":
                             return ProbeResult(
                                 url=url,
                                 status_code=root_status,
                                 www_authenticate=root_www_auth,
                                 detected_method=root_method,
+                                note=root_note,
                             )
                     except Exception:
                         pass  # root fallback failed, keep original result
@@ -168,6 +206,7 @@ async def _probe_single(
                 status_code=status,
                 www_authenticate=www_auth,
                 detected_method=method,
+                note=note,
             )
         except Exception as e:
             return ProbeResult(
@@ -1085,9 +1124,11 @@ def print_results(
             info = auth_map[url]
             print(f"\n  {url}")
             verdict = "unknown"
+            note = None
             if info.probe_result:
                 probe = info.probe_result
                 verdict = probe.detected_method or "unknown"
+                note = probe.note
                 if probe.error:
                     print(f"    Probe:   error — {probe.error}")
                 elif probe.www_authenticate:
@@ -1095,6 +1136,8 @@ def print_results(
                 else:
                     print(f"    Probe:   {probe.status_code} — {verdict}")
             print(f"    Verdict: {verdict}")
+            if note:
+                print(f"    Note:    {note}")
         print(f"\n{'=' * 70}")
 
     if suspect_count:
@@ -1158,6 +1201,7 @@ def write_results(
                     "status_code": p.status_code,
                     "www_authenticate": p.www_authenticate,
                     "detected_method": p.detected_method,
+                    "note": p.note,
                     "error": p.error,
                 }
             auth_section[url] = entry

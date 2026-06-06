@@ -656,26 +656,48 @@ class TestParseWwwAuthenticate:
 
 
 class TestClassifyProbe:
+    # _classify_probe returns (detected_method, note). detected_method is an
+    # auth verdict only; note carries the inconclusive/heads-up context.
     def test_401_with_basic(self):
-        assert _classify_probe(401, 'Basic realm="x"') == "basic"
+        assert _classify_probe(401, 'Basic realm="x"') == ("basic", None)
 
     def test_401_without_header(self):
-        assert _classify_probe(401, None) == "unknown"
+        # Bare 401: auth required, but the scheme isn't disclosed.
+        assert _classify_probe(401, None) == ("unknown", "auth required, scheme undisclosed")
 
     def test_403_with_bearer_challenge(self):
         # RFC 6750 insufficient_scope: 403 carries a Bearer challenge, which
-        # must win over the opaque "forbidden" classification.
-        assert _classify_probe(403, 'Bearer error="insufficient_scope"') == "bearer"
+        # must win over the opaque "forbidden" note.
+        assert _classify_probe(403, 'Bearer error="insufficient_scope"') == ("bearer", None)
 
     def test_403_without_header(self):
-        assert _classify_probe(403, None) == "forbidden"
+        assert _classify_probe(403, None) == ("unknown", "forbidden (403)")
+
+    def test_400_is_a_note(self):
+        assert _classify_probe(400, None) == ("unknown", "bad request (400)")
+
+    def test_404_is_a_note(self):
+        assert _classify_probe(404, None) == ("unknown", "not found (404)")
+
+    def test_407_proxy_auth_is_a_note(self):
+        # A proxy in the path is a topology heads-up, not the service's method.
+        assert _classify_probe(407, None) == ("unknown", "proxy authentication required (407)")
+
+    def test_5xx_note_carries_reason_phrase(self):
+        # The server's reason phrase rides along — 502/503/504 distinguish
+        # proxy/upstream topology from a plain 500.
+        assert _classify_probe(503, None, reason="Service Unavailable") == (
+            "unknown", "server error: 503 Service Unavailable")
+
+    def test_5xx_without_reason_phrase(self):
+        assert _classify_probe(500, None) == ("unknown", "server error: 500")
 
     def test_200_with_header(self):
         # A challenge on any status is authoritative (RFC 7235 §4.1 MAY clause).
-        assert _classify_probe(200, "Negotiate") == "negotiate"
+        assert _classify_probe(200, "Negotiate") == ("negotiate", None)
 
     def test_200_without_header(self):
-        assert _classify_probe(200, None) == "none"
+        assert _classify_probe(200, None) == ("none", None)
 
     def test_3xx_offhost_with_keyword_is_oauth(self):
         # Redirect off-host to an IdP whose URL carries an auth keyword:
@@ -684,7 +706,7 @@ class TestClassifyProbe:
             302, None,
             "https://login.microsoftonline.com/authorize?client_id=x",
             "https://app.example.com/api",
-        ) == "oauth"
+        ) == ("oauth", None)
 
     def test_3xx_samehost_with_keyword_is_login_redirect(self):
         # Same-origin redirect to a login path is local form auth, not OAuth.
@@ -692,42 +714,51 @@ class TestClassifyProbe:
             302, None,
             "https://app.example.com/login",
             "https://app.example.com/dashboard",
-        ) == "login_redirect"
+        ) == ("login_redirect", None)
 
     def test_3xx_relative_location_with_keyword_is_login_redirect(self):
         # A relative "Location: /login" resolves to the same host once joined.
         assert _classify_probe(
             302, None, "/login", "https://app.example.com/dashboard",
-        ) == "login_redirect"
+        ) == ("login_redirect", None)
 
-    def test_3xx_offhost_without_keyword_is_external_redirect(self):
-        # Off-host redirect with no auth hint is still worth flagging as a
-        # cross-origin dependency, distinct from a plain same-host redirect.
+    def test_3xx_offhost_without_keyword_notes_off_origin(self):
+        # Off-host redirect with no auth hint isn't an auth method, but the
+        # cross-origin dependency is worth flagging in the note.
         assert _classify_probe(
             302, None,
             "https://cdn.othercorp.com/assets",
             "https://app.example.com/static",
-        ) == "external_redirect"
+        ) == ("unknown", "redirects off-origin to cdn.othercorp.com")
 
-    def test_3xx_samehost_without_keyword_is_redirect(self):
-        assert _classify_probe(
+    def test_3xx_samehost_without_keyword_notes_redirect(self):
+        method, note = _classify_probe(
             302, None,
             "https://app.example.com/new-path",
             "https://app.example.com/old-path",
-        ) == "redirect"
+        )
+        assert method == "unknown"
+        assert note == "redirects to https://app.example.com/new-path"
+        assert "off-origin" not in note
 
-    def test_3xx_relative_location_without_keyword_is_redirect(self):
+    def test_3xx_relative_location_without_keyword_notes_redirect(self):
         assert _classify_probe(
             302, None, "/new-path", "https://app.example.com/old-path",
-        ) == "redirect"
+        ) == ("unknown", "redirects to https://app.example.com/new-path")
 
     def test_3xx_host_comparison_is_case_insensitive(self):
         # Differing host casing must not be mistaken for an off-host redirect.
-        assert _classify_probe(
+        method, note = _classify_probe(
             302, None,
             "https://APP.example.com/new-path",
             "https://app.example.com/old-path",
-        ) == "redirect"
+        )
+        assert method == "unknown"
+        assert "off-origin" not in note
+
+    def test_3xx_no_location_is_a_note(self):
+        assert _classify_probe(302, None, "", "https://app.example.com/x") == (
+            "unknown", "redirect (no Location header)")
 
 
 # ===========================================================================
@@ -992,7 +1023,10 @@ async def test_probe_redirect(auth_server):
     results = await probe_urls([f"{auth_server}/auth/redirect"], timeout=5.0)
     assert len(results) == 1
     assert results[0].status_code == 301
-    assert results[0].detected_method == "redirect"
+    # A plain same-host redirect with no auth hint isn't an auth method —
+    # it's "unknown" with the target recorded in the note.
+    assert results[0].detected_method == "unknown"
+    assert "redirects to" in results[0].note
 
 
 @pytest.mark.asyncio
@@ -1018,7 +1052,10 @@ async def test_probe_server_error(auth_server):
     results = await probe_urls([f"{auth_server}/auth/server-error"], timeout=5.0)
     assert len(results) == 1
     assert results[0].status_code == 500
-    assert results[0].detected_method == "server_error"
+    # 5xx is inconclusive for auth; the status (and reason phrase) ride in note.
+    assert results[0].detected_method == "unknown"
+    assert results[0].note is not None
+    assert "server error: 500" in results[0].note
 
 
 class TestHostRootUrl:
