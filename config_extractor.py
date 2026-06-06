@@ -13,6 +13,7 @@ import socket
 import string
 import sys
 from dataclasses import dataclass, field
+from enum import StrEnum
 from urllib.parse import urljoin, urlparse
 
 import aiohttp
@@ -31,22 +32,40 @@ class ConfigSource:
     error: str | None = None
 
 
+class AuthMethod(StrEnum):
+    """Closed vocabulary for an auth verdict. A StrEnum so members compare
+    equal to and serialize as their lowercase string value."""
+    BASIC = "basic"
+    BEARER = "bearer"
+    NEGOTIATE = "negotiate"
+    NTLM = "ntlm"
+    # An uncommon but well-formed challenge scheme (Digest, vendor schemes, ...).
+    # The specific scheme is named in ProbeResult.note; the raw header is also
+    # preserved in ProbeResult.www_authenticate.
+    OTHER = "other"
+    OAUTH = "oauth"
+    LOGIN_REDIRECT = "login_redirect"
+    NONE = "none"
+    UNKNOWN = "unknown"
+
+
 @dataclass
 class ProbeResult:
     """Auth evidence from HTTP probing."""
     url: str
     status_code: int | None
     www_authenticate: str | None
-    # Auth verdict only: "basic" | "bearer" | "negotiate" | "ntlm" (or another
-    # challenge scheme) | "oauth" | "login_redirect" | "none" | "unknown".
-    # None on transport error (see `error`).
-    detected_method: str | None
-    # Short human-readable context, set only when the verdict is inconclusive
-    # or worth flagging — e.g. "forbidden (403)", "not found (404)",
-    # "server error: 503 Service Unavailable", "proxy authentication required
-    # (407)", "redirects off-origin to sso.corp.local". None when a method was
-    # identified. Distinct from `error`, which is reserved for transport
-    # failures (a 5xx is a successful HTTP transaction, so it lands here).
+    # Auth verdict, an AuthMethod (one of BASIC/BEARER/NEGOTIATE/NTLM/OTHER/
+    # OAUTH/LOGIN_REDIRECT/NONE/UNKNOWN). None only on transport error (see
+    # `error`).
+    detected_method: AuthMethod | None
+    # Short human-readable context, set when the verdict is inconclusive or
+    # coarse — e.g. "forbidden (403)", "not found (404)", "server error: 503
+    # Service Unavailable", "challenge scheme: digest" (naming an OTHER verdict),
+    # "redirects off-origin to sso.corp.local". None when the verdict already
+    # says everything (a named scheme, NONE, a clean redirect). Distinct from
+    # `error`, which is reserved for transport failures (a 5xx is a successful
+    # HTTP transaction, so it lands here).
     note: str | None = None
     error: str | None = None
 
@@ -62,11 +81,19 @@ class AuthInfo:
 # HTTP probing
 # ---------------------------------------------------------------------------
 
-def _parse_www_authenticate(header: str) -> str:
-    """Extract the auth scheme from a WWW-Authenticate header value."""
-    scheme = header.strip().split()[0].lower() if header else ""
-    mapping = {"basic": "basic", "bearer": "bearer", "negotiate": "negotiate", "ntlm": "ntlm"}
-    return mapping.get(scheme, scheme or "unknown")
+def _parse_www_authenticate(header: str) -> tuple[AuthMethod, str | None]:
+    """Extract the auth scheme from a WWW-Authenticate header value, as
+    (method, note). A known challenge scheme maps to its AuthMethod with no
+    note; an unrecognized but well-formed scheme is OTHER with the scheme named
+    in the note; a truthy-but-tokenless header is UNKNOWN (a case the old
+    `scheme or "unknown"` swallowed silently)."""
+    scheme = header.strip().split()[0].lower() if header.strip() else ""
+    known = {"basic", "bearer", "negotiate", "ntlm"}
+    if scheme in known:
+        return AuthMethod(scheme), None
+    if scheme:
+        return AuthMethod.OTHER, f"challenge scheme: {scheme}"
+    return AuthMethod.UNKNOWN, "malformed WWW-Authenticate"
 
 
 def _host_root_url(url: str) -> str | None:
@@ -101,14 +128,14 @@ async def _do_probe_request(
                 resp.reason or "")
 
 
-def _classify_redirect(location: str, url: str) -> tuple[str, str | None]:
+def _classify_redirect(location: str, url: str) -> tuple[AuthMethod, str | None]:
     """Sub-classify a 3xx response into (detected_method, note).
 
-    An auth-flagged redirect is a real auth verdict (oauth / login_redirect);
-    a plain route change is not a method, so it returns "unknown" with a note
+    An auth-flagged redirect is a real auth verdict (OAUTH / LOGIN_REDIRECT);
+    a plain route change is not a method, so it returns UNKNOWN with a note
     describing where it points."""
     if not location:
-        return "unknown", "redirect (no Location header)"
+        return AuthMethod.UNKNOWN, "redirect (no Location header)"
     has_keyword = any(kw in location.lower()
                       for kw in ("oauth", "authorize", "login", "auth"))
     # Compare the redirect target's host to the probed host. A federated
@@ -121,46 +148,45 @@ def _classify_redirect(location: str, url: str) -> tuple[str, str | None]:
     probed_host = (urlparse(url).hostname or "").lower()
     off_host = bool(target_host) and target_host != probed_host
     if has_keyword:
-        return ("oauth", None) if off_host else ("login_redirect", None)
+        return (AuthMethod.OAUTH, None) if off_host else (AuthMethod.LOGIN_REDIRECT, None)
     if off_host:
-        return "unknown", f"redirects off-origin to {target_host}"
-    return "unknown", f"redirects to {target}"
+        return AuthMethod.UNKNOWN, f"redirects off-origin to {target_host}"
+    return AuthMethod.UNKNOWN, f"redirects to {target}"
 
 
 def _classify_probe(status: int, www_auth: str | None, location: str = "",
-                    url: str = "", reason: str = "") -> tuple[str, str | None]:
+                    url: str = "", reason: str = "") -> tuple[AuthMethod, str | None]:
     """Classify a probe response into (detected_method, note).
 
-    detected_method is an auth verdict only — a challenge scheme ("basic",
-    "bearer", "negotiate", "ntlm", ...), "oauth", "login_redirect", "none",
-    or "unknown". note is a short human-readable string set only when the
-    method is inconclusive or worth flagging (why we couldn't pin a method, or
-    a heads-up like a proxy / off-origin redirect); it is None otherwise."""
+    detected_method is an AuthMethod verdict; note is a short human-readable
+    string set only when the verdict is inconclusive or coarse (why we couldn't
+    pin a method, a heads-up like a proxy / off-origin redirect, or the specific
+    scheme behind an OTHER verdict); it is None otherwise."""
     # A WWW-Authenticate challenge is authoritative on any status, not just
     # 401. RFC 6750 (OAuth Bearer) returns it on 403 for insufficient_scope,
     # and the header MAY appear on other statuses per RFC 7235 §4.1.
     if www_auth:
-        return _parse_www_authenticate(www_auth), None
+        return _parse_www_authenticate(www_auth)
     if status == 401:
         # Auth is required, but the server didn't disclose the scheme.
-        return "unknown", "auth required, scheme undisclosed"
+        return AuthMethod.UNKNOWN, "auth required, scheme undisclosed"
     if status == 403:
-        return "unknown", "forbidden (403)"
+        return AuthMethod.UNKNOWN, "forbidden (403)"
     if 200 <= status < 300:
-        return "none", None
+        return AuthMethod.NONE, None
     if 300 <= status < 400:
         return _classify_redirect(location, url)
     if status == 400:
-        return "unknown", "bad request (400)"
+        return AuthMethod.UNKNOWN, "bad request (400)"
     if status == 404:
-        return "unknown", "not found (404)"
+        return AuthMethod.UNKNOWN, "not found (404)"
     if status == 407:
-        return "unknown", "proxy authentication required (407)"
+        return AuthMethod.UNKNOWN, "proxy authentication required (407)"
     if 500 <= status < 600:
         detail = f"{status} {reason}".strip()
-        return "unknown", f"server error: {detail}"
+        return AuthMethod.UNKNOWN, f"server error: {detail}"
     detail = f"{status} {reason}".strip()
-    return "unknown", f"unexpected status {detail}"
+    return AuthMethod.UNKNOWN, f"unexpected status {detail}"
 
 
 async def _probe_single(
@@ -188,9 +214,9 @@ async def _probe_single(
                         root_status, root_www_auth, root_location, root_reason = await _do_probe_request(session, root, timeout)
                         root_method, root_note = _classify_probe(root_status, root_www_auth, root_location, root, root_reason)
                         # Use the root result only if it actually identified an
-                        # auth method. An "unknown" root tells us nothing the
+                        # auth method. An UNKNOWN root tells us nothing the
                         # path's own outcome didn't already.
-                        if root_method != "unknown":
+                        if root_method is not AuthMethod.UNKNOWN:
                             return ProbeResult(
                                 url=url,
                                 status_code=root_status,

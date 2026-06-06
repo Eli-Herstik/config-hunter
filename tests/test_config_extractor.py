@@ -639,20 +639,31 @@ async def test_interaction_triggers_xhr(test_server):
 
 
 class TestParseWwwAuthenticate:
+    # Returns (method, note). Known schemes carry no note; an unrecognized but
+    # well-formed scheme is OTHER with the scheme named; a tokenless header is
+    # UNKNOWN. StrEnum members compare equal to their string value, so the
+    # bare-string asserts below double as a check on that contract.
     def test_basic(self):
-        assert _parse_www_authenticate('Basic realm="test"') == "basic"
+        assert _parse_www_authenticate('Basic realm="test"') == ("basic", None)
 
     def test_bearer(self):
-        assert _parse_www_authenticate("Bearer") == "bearer"
+        assert _parse_www_authenticate("Bearer") == ("bearer", None)
 
     def test_negotiate(self):
-        assert _parse_www_authenticate("Negotiate") == "negotiate"
+        assert _parse_www_authenticate("Negotiate") == ("negotiate", None)
 
-    def test_unknown_scheme(self):
-        assert _parse_www_authenticate("CustomScheme") == "customscheme"
+    def test_other_scheme_is_named_in_note(self):
+        # An uncommon scheme collapses to OTHER, but the specific name survives
+        # in the note (and the raw header is kept on the ProbeResult).
+        assert _parse_www_authenticate("Digest realm=x") == (
+            "other", "challenge scheme: digest")
 
-    def test_empty(self):
-        assert _parse_www_authenticate("") == "unknown"
+    def test_empty_is_malformed(self):
+        assert _parse_www_authenticate("") == ("unknown", "malformed WWW-Authenticate")
+
+    def test_whitespace_only_is_malformed(self):
+        # Truthy but tokenless — the case the old `scheme or "unknown"` swallowed.
+        assert _parse_www_authenticate("   ") == ("unknown", "malformed WWW-Authenticate")
 
 
 class TestClassifyProbe:
