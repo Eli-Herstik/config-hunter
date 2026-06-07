@@ -319,16 +319,20 @@ async def _resolve_single(
     host: str,
     semaphore: asyncio.Semaphore,
     timeout: float,
-) -> dict | None:
-    """Resolve one host; return {host, error} on failure, None on success."""
+) -> dict:
+    """Resolve one host; return {host, ips} on success or {host, error} on failure.
+    `ips` is the distinct resolved addresses (IPv4 + IPv6), sorted."""
     loop = asyncio.get_running_loop()
     async with semaphore:
         try:
-            await asyncio.wait_for(
+            infos = await asyncio.wait_for(
                 loop.getaddrinfo(host, None),
                 timeout=timeout,
             )
-            return None
+            # getaddrinfo yields (family, type, proto, canonname, sockaddr);
+            # sockaddr[0] is the address string for both AF_INET and AF_INET6.
+            ips = sorted({info[4][0] for info in infos})
+            return {"host": host, "ips": ips}
         except Exception as e:
             return {"host": host, "error": _classify_dns_error(e)}
 
@@ -337,15 +341,20 @@ async def resolve_hosts(
     hosts: list[str],
     timeout: float = 3.0,
     max_concurrent: int = 20,
-) -> list[dict]:
-    """Resolve each host via the system resolver; return [{host, error}] for failures only."""
+) -> tuple[list[dict], dict[str, list[str]]]:
+    """Resolve each host via the system resolver.
+
+    Return (failures, ip_map): `failures` is [{host, error}] for hosts that
+    failed to resolve (sorted by host); `ip_map` is {host: [ip, ...]} for those
+    that resolved."""
     unique_hosts = list(dict.fromkeys(hosts))
     semaphore = asyncio.Semaphore(max_concurrent)
     tasks = [_resolve_single(h, semaphore, timeout) for h in unique_hosts]
     results = await asyncio.gather(*tasks)
-    failures = [r for r in results if r is not None]
+    failures = [r for r in results if "error" in r]
     failures.sort(key=lambda r: r["host"])
-    return failures
+    ip_map = {r["host"]: r["ips"] for r in results if "ips" in r}
+    return failures, ip_map
 
 
 # ---------------------------------------------------------------------------
@@ -1166,6 +1175,7 @@ def write_results(
     path: str,
     auth_map: dict[str, AuthInfo] | None = None,
     unresolved: list[dict] | None = None,
+    ip_map: dict[str, list[str]] | None = None,
 ) -> None:
     all_clean: set[str] = set()
     suspect_index: dict[str, dict] = {}
@@ -1191,7 +1201,10 @@ def write_results(
 
     # Per-host roll-up of the auth probes: one collapsed verdict per host,
     # restricted to hosts that passed DNS resolution (full inventory minus the
-    # DNS failures). `auth_method` is the highest-precedence AuthMethod seen
+    # DNS failures). `ips` is the distinct resolved addresses (IPv4 + IPv6,
+    # sorted) from the DNS pass — a host can map to several (round-robin DNS,
+    # load balancers, dual-stack), and shared IPs across hostnames reveal a
+    # common backend. `auth_method` is the highest-precedence AuthMethod seen
     # across the host's probed URLs (see _VERDICT_PRECEDENCE); `status_codes`
     # lists the distinct HTTP statuses observed — the evidence behind the
     # verdict, and what disambiguates an `unknown` host (403 vs 404 vs 503);
@@ -1219,6 +1232,7 @@ def write_results(
         auth_verdicts = {p.detected_method for _, p in probes
                          if p and p.detected_method is not None}
         hosts_section[host] = {
+            "ips": (ip_map or {}).get(host, []),
             "auth_method": _collapse_host_verdict(auth_verdicts),
             "status_codes": sorted({p.status_code for _, p in probes
                                     if p and p.status_code is not None}),
@@ -1376,11 +1390,12 @@ def main() -> None:
         probe_cookies[c["name"]] = c["value"]
 
     unresolved: list[dict] = []
+    ip_map: dict[str, list[str]] = {}
     probeable_urls = unique_urls
     if unique_urls:
         unique_url_hosts = sorted({urlparse(u).hostname for u in unique_urls if urlparse(u).hostname})
         print(f"Resolving {len(unique_url_hosts)} hosts...")
-        unresolved = asyncio.run(resolve_hosts(unique_url_hosts))
+        unresolved, ip_map = asyncio.run(resolve_hosts(unique_url_hosts))
         unresolved_set = {entry["host"] for entry in unresolved}
         if unresolved_set:
             probeable_urls = [u for u in unique_urls if urlparse(u).hostname not in unresolved_set]
@@ -1401,7 +1416,7 @@ def main() -> None:
         merge_probe_results(auth_map, probes)
 
     if args.output:
-        write_results(sources, args.output, auth_map, unresolved)
+        write_results(sources, args.output, auth_map, unresolved, ip_map)
 
 
 if __name__ == "__main__":

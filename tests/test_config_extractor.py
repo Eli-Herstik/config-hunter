@@ -597,9 +597,13 @@ def test_write_results_hosts_map_collapses_and_filters(tmp_path):
             error="Cannot connect to host"),
     }
     unresolved = [{"host": "dead.example.com", "error": "NXDOMAIN"}]
+    ip_map = {
+        "svc.example.com": ["10.0.0.5"],
+        "down.example.com": ["10.0.0.6", "10.0.0.7"],  # multiple A records
+    }
 
     out = tmp_path / "r.json"
-    write_results(sources, str(out), auth_map, unresolved)
+    write_results(sources, str(out), auth_map, unresolved, ip_map)
     with open(out, "r", encoding="utf-8") as f:
         data = json.load(f)
 
@@ -608,6 +612,7 @@ def test_write_results_hosts_map_collapses_and_filters(tmp_path):
     assert "dead.example.com" not in hosts  # excluded: failed DNS resolution
 
     svc = hosts["svc.example.com"]
+    assert svc["ips"] == ["10.0.0.5"]
     assert svc["auth_method"] == "bearer"  # concrete scheme outranks none
     assert svc["status_codes"] == [200, 401]  # distinct, sorted
     # notes: keyed by the URL that carried one; the note-less `/` is absent
@@ -617,6 +622,7 @@ def test_write_results_hosts_map_collapses_and_filters(tmp_path):
     assert svc["unreachable"] == 0
 
     down = hosts["down.example.com"]
+    assert down["ips"] == ["10.0.0.6", "10.0.0.7"]  # multiple IPs preserved
     assert down["auth_method"] is None     # only a transport error, no verdict
     assert down["status_codes"] == []      # transport error carries no status
     assert down["notes"] == {}             # transport error sets `error`, not a note
@@ -1371,29 +1377,34 @@ _BAD_HOST = "doesnotexist.invalid"
 
 @pytest.mark.asyncio
 async def test_resolve_hosts_returns_empty_for_resolvable():
-    result = await resolve_hosts(["localhost"])
-    assert result == []
+    failures, ip_map = await resolve_hosts(["localhost"])
+    assert failures == []
+    # A resolvable host is captured in ip_map with its address(es).
+    assert ip_map["localhost"]
+    assert all(isinstance(ip, str) for ip in ip_map["localhost"])
 
 
 @pytest.mark.asyncio
 async def test_resolve_hosts_reports_nxdomain():
-    result = await resolve_hosts([_BAD_HOST])
-    assert len(result) == 1
-    assert result[0]["host"] == _BAD_HOST
-    assert result[0]["error"] == "NXDOMAIN"
+    failures, ip_map = await resolve_hosts([_BAD_HOST])
+    assert len(failures) == 1
+    assert failures[0]["host"] == _BAD_HOST
+    assert failures[0]["error"] == "NXDOMAIN"
+    assert _BAD_HOST not in ip_map  # a failed host yields no IPs
 
 
 @pytest.mark.asyncio
 async def test_resolve_hosts_mixed():
-    result = await resolve_hosts(["localhost", _BAD_HOST])
-    hosts = {entry["host"] for entry in result}
-    assert hosts == {_BAD_HOST}
+    failures, ip_map = await resolve_hosts(["localhost", _BAD_HOST])
+    assert {entry["host"] for entry in failures} == {_BAD_HOST}
+    assert ip_map.get("localhost")  # resolved
+    assert _BAD_HOST not in ip_map  # failed
 
 
 @pytest.mark.asyncio
 async def test_resolve_hosts_dedupes():
-    result = await resolve_hosts([_BAD_HOST, _BAD_HOST, _BAD_HOST])
-    assert len(result) == 1
+    failures, _ = await resolve_hosts([_BAD_HOST, _BAD_HOST, _BAD_HOST])
+    assert len(failures) == 1
 
 
 def test_write_results_includes_unresolved_hosts(tmp_path):
@@ -1434,7 +1445,7 @@ async def test_probe_filtering_skips_unresolved_hosts(test_server):
     # Replicate the main() flow: resolve, filter, probe, then check auth_map.
     auth_map = {u: AuthInfo(url=u) for u in unique_urls}
     hosts = sorted({urlparse(u).hostname for u in unique_urls if urlparse(u).hostname})
-    unresolved = await resolve_hosts(hosts)
+    unresolved, _ = await resolve_hosts(hosts)
     unresolved_set = {entry["host"] for entry in unresolved}
 
     assert _BAD_HOST in unresolved_set
