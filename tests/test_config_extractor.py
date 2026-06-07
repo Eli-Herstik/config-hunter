@@ -563,12 +563,12 @@ def test_write_results_quarantines_suspect_urls(tmp_path):
         assert s["sources"] == ["js: https://test/bundle.js"]
 
 
-def _auth_info(url, method, *, status=200, error=None):
+def _auth_info(url, method, *, status=200, note=None, error=None):
     return AuthInfo(
         url=url,
         probe_result=ProbeResult(
             url=url, status_code=status, www_authenticate=None,
-            detected_method=method, error=error,
+            detected_method=method, note=note, error=error,
         ),
     )
 
@@ -588,7 +588,8 @@ def test_write_results_hosts_map_collapses_and_filters(tmp_path):
     )]
     auth_map = {
         "https://svc.example.com/api": _auth_info(
-            "https://svc.example.com/api", AuthMethod.BEARER, status=401),
+            "https://svc.example.com/api", AuthMethod.BEARER, status=401,
+            note="challenged at /api"),
         "https://svc.example.com/": _auth_info(
             "https://svc.example.com/", AuthMethod.NONE),
         "https://down.example.com/x": _auth_info(
@@ -608,12 +609,17 @@ def test_write_results_hosts_map_collapses_and_filters(tmp_path):
 
     svc = hosts["svc.example.com"]
     assert svc["auth_method"] == "bearer"  # concrete scheme outranks none
+    assert svc["status_codes"] == [200, 401]  # distinct, sorted
+    # notes: keyed by the URL that carried one; the note-less `/` is absent
+    assert svc["notes"] == {"https://svc.example.com/api": "challenged at /api"}
     assert svc["mixed"] is True
     assert svc["urls_probed"] == 2
     assert svc["unreachable"] == 0
 
     down = hosts["down.example.com"]
     assert down["auth_method"] is None     # only a transport error, no verdict
+    assert down["status_codes"] == []      # transport error carries no status
+    assert down["notes"] == {}             # transport error sets `error`, not a note
     assert down["mixed"] is False
     assert down["urls_probed"] == 1
     assert down["unreachable"] == 1

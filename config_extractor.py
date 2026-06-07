@@ -1162,32 +1162,42 @@ def write_results(
 
     # Per-host roll-up of the auth probes: one collapsed verdict per host,
     # restricted to hosts that passed DNS resolution (full inventory minus the
-    # DNS failures). The verdict is the highest-precedence AuthMethod seen
-    # across the host's probed URLs (see _VERDICT_PRECEDENCE); `mixed` flags a
-    # host whose URLs disagreed, and `unreachable` counts URLs that resolved but
-    # failed to probe (transport error), so a DNS-OK-but-dead service isn't
-    # misread as "no auth".
+    # DNS failures). `auth_method` is the highest-precedence AuthMethod seen
+    # across the host's probed URLs (see _VERDICT_PRECEDENCE); `status_codes`
+    # lists the distinct HTTP statuses observed — the evidence behind the
+    # verdict, and what disambiguates an `unknown` host (403 vs 404 vs 503);
+    # `notes` maps each probed URL that carried an inconclusive/coarse note to
+    # that note (the scheme behind an `other`, a redirect target, why a method
+    # couldn't be pinned) — the host-scoped view the flat `auth` section can't
+    # give, and which endpoint disagreed when `mixed`; `mixed` flags a host
+    # whose URLs disagreed; and `unreachable` counts URLs that resolved but
+    # failed to probe (transport error, no status), so a DNS-OK-but-dead service
+    # isn't misread as "no auth".
     unresolved_set = {e["host"] for e in unresolved} if unresolved else set()
     resolved_hosts = {h for h in hosts if h not in unresolved_set}
 
-    host_verdicts: dict[str, list[AuthMethod | None]] = {}
+    host_probes: dict[str, list[tuple[str, ProbeResult | None]]] = {}
     if auth_map:
         for url, info in auth_map.items():
             host = urlparse(url).hostname
             if not host:
                 continue
-            method = info.probe_result.detected_method if info.probe_result else None
-            host_verdicts.setdefault(host, []).append(method)
+            host_probes.setdefault(host, []).append((url, info.probe_result))
 
     hosts_section: dict = {}
     for host in sorted(resolved_hosts):
-        verdicts = host_verdicts.get(host, [])
-        auth_verdicts = {m for m in verdicts if m is not None}
+        probes = host_probes.get(host, [])
+        auth_verdicts = {p.detected_method for _, p in probes
+                         if p and p.detected_method is not None}
         hosts_section[host] = {
             "auth_method": _collapse_host_verdict(auth_verdicts),
+            "status_codes": sorted({p.status_code for _, p in probes
+                                    if p and p.status_code is not None}),
+            "notes": {url: p.note for url, p in sorted(probes) if p and p.note},
             "mixed": len(auth_verdicts) > 1,
-            "urls_probed": len(verdicts),
-            "unreachable": sum(1 for m in verdicts if m is None),
+            "urls_probed": len(probes),
+            "unreachable": sum(1 for _, p in probes
+                               if not p or p.detected_method is None),
         }
 
     suspect_urls = [
