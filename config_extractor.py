@@ -10,6 +10,7 @@ import asyncio
 import json
 import re
 import socket
+import ssl
 import string
 import sys
 from dataclasses import dataclass, field
@@ -189,6 +190,34 @@ def _classify_probe(status: int, www_auth: str | None, location: str = "",
     return AuthMethod.UNKNOWN, f"unexpected status {detail}"
 
 
+def _classify_probe_error(exc: BaseException) -> str:
+    """Render a transport error from probing as a short, non-empty reason.
+
+    Mirrors _classify_dns_error. aiohttp's `total` timeout raises a bare
+    asyncio.TimeoutError whose str() is the empty string, so a plain str(exc)
+    would leave ProbeResult.error uninformative (""). Bucket the common cases
+    and always fall back to a non-empty representation."""
+    if isinstance(exc, asyncio.TimeoutError):
+        # Also catches aiohttp.ServerTimeoutError (a subclass); the headline is
+        # "timeout" regardless of which clock (total/connect/read) fired.
+        return "timeout"
+    if isinstance(exc, ssl.SSLError):
+        reason = getattr(exc, "reason", None)
+        return f"TLS error: {reason}" if reason else "TLS error"
+    if isinstance(exc, aiohttp.ClientConnectorError):
+        # The wrapped OSError carries the actionable detail (connection
+        # refused, no route to host, ...).
+        os_err = getattr(exc, "os_error", None)
+        if os_err is not None:
+            return f"connection failed: {os_err.strerror or os_err}"
+        return f"connection failed: {exc}"
+    if isinstance(exc, aiohttp.ServerDisconnectedError):
+        return "server disconnected"
+    if isinstance(exc, aiohttp.ClientConnectionError):
+        return f"connection error: {exc}".rstrip(": ")
+    return str(exc) or repr(exc)
+
+
 async def _probe_single(
     session: aiohttp.ClientSession,
     url: str,
@@ -240,7 +269,7 @@ async def _probe_single(
                 status_code=None,
                 www_authenticate=None,
                 detected_method=None,
-                error=str(e),
+                error=_classify_probe_error(e),
             )
 
 
