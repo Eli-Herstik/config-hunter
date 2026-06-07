@@ -29,6 +29,7 @@ from config_extractor import (
     ConfigSource,
     AuthInfo,
     ProbeResult,
+    AuthMethod,
     _host_root_url,
     probe_urls,
     merge_probe_results,
@@ -528,9 +529,7 @@ async def test_output_file_writing(test_server, tmp_path):
 
     assert isinstance(data, dict)
     assert "sources" in data
-    assert "unique_hosts" in data
     assert "suspect_urls" in data
-    assert isinstance(data["unique_hosts"], list)
     assert isinstance(data["suspect_urls"], list)
     assert len(data["sources"]) > 0
     for entry in data["sources"]:
@@ -554,7 +553,6 @@ def test_write_results_quarantines_suspect_urls(tmp_path):
         data = json.load(f)
 
     assert data["sources"][0]["urls"] == ["https://real.example.com/api"]
-    assert data["unique_hosts"] == ["real.example.com"]
     assert {s["url"] for s in data["suspect_urls"]} == {
         "https://${env}/x", "https://www.%/y",
     }
@@ -563,6 +561,76 @@ def test_write_results_quarantines_suspect_urls(tmp_path):
     assert reasons["https://www.%/y"] == "bad_host"
     for s in data["suspect_urls"]:
         assert s["sources"] == ["js: https://test/bundle.js"]
+
+
+def _auth_info(url, method, *, status=200, error=None):
+    return AuthInfo(
+        url=url,
+        probe_result=ProbeResult(
+            url=url, status_code=status, www_authenticate=None,
+            detected_method=method, error=error,
+        ),
+    )
+
+
+def test_write_results_hosts_map_collapses_and_filters(tmp_path):
+    """The hosts map lists only resolved hosts, collapses each host's per-URL
+    verdicts by precedence (concrete scheme > none), flags disagreement with
+    `mixed`, and counts probe transport errors as `unreachable`."""
+    sources = [ConfigSource(
+        origin="js: https://app/bundle.js",
+        urls_found=[
+            "https://svc.example.com/api",   # bearer
+            "https://svc.example.com/",      # none -> host is mixed
+            "https://down.example.com/x",    # resolved but probe failed
+            "https://dead.example.com/y",    # unresolved -> excluded
+        ],
+    )]
+    auth_map = {
+        "https://svc.example.com/api": _auth_info(
+            "https://svc.example.com/api", AuthMethod.BEARER, status=401),
+        "https://svc.example.com/": _auth_info(
+            "https://svc.example.com/", AuthMethod.NONE),
+        "https://down.example.com/x": _auth_info(
+            "https://down.example.com/x", None, status=None,
+            error="Cannot connect to host"),
+    }
+    unresolved = [{"host": "dead.example.com", "error": "NXDOMAIN"}]
+
+    out = tmp_path / "r.json"
+    write_results(sources, str(out), auth_map, unresolved)
+    with open(out, "r", encoding="utf-8") as f:
+        data = json.load(f)
+
+    hosts = data["hosts"]
+    assert set(hosts) == {"svc.example.com", "down.example.com"}
+    assert "dead.example.com" not in hosts  # excluded: failed DNS resolution
+
+    svc = hosts["svc.example.com"]
+    assert svc["auth_method"] == "bearer"  # concrete scheme outranks none
+    assert svc["mixed"] is True
+    assert svc["urls_probed"] == 2
+    assert svc["unreachable"] == 0
+
+    down = hosts["down.example.com"]
+    assert down["auth_method"] is None     # only a transport error, no verdict
+    assert down["mixed"] is False
+    assert down["urls_probed"] == 1
+    assert down["unreachable"] == 1
+
+
+def test_write_results_omits_hosts_map_without_resolution(tmp_path):
+    """No DNS-resolution pass (unresolved is None) -> no `hosts` map, since
+    'passed DNS resolution' is undefined."""
+    sources = [ConfigSource(
+        origin="js: https://app/bundle.js",
+        urls_found=["https://svc.example.com/api"],
+    )]
+    out = tmp_path / "r.json"
+    write_results(sources, str(out))
+    with open(out, "r", encoding="utf-8") as f:
+        data = json.load(f)
+    assert "hosts" not in data
 
 
 @pytest.mark.asyncio

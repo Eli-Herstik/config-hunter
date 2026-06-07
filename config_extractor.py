@@ -1103,6 +1103,34 @@ async def crawl(
 # Reporting
 # ---------------------------------------------------------------------------
 
+# Precedence for collapsing a host's per-URL auth verdicts into one headline
+# method. Earlier wins: a concrete challenge scheme is the most informative
+# answer to "how does this service authenticate", redirect-based flows come
+# next, NONE ("definitively open") below those, and UNKNOWN ("inconclusive")
+# last so it never masks a real verdict. Transport errors (detected_method is
+# None) are not auth verdicts — they're counted as `unreachable`, not ranked.
+_VERDICT_PRECEDENCE: tuple[AuthMethod, ...] = (
+    AuthMethod.NEGOTIATE,
+    AuthMethod.NTLM,
+    AuthMethod.BEARER,
+    AuthMethod.BASIC,
+    AuthMethod.OTHER,
+    AuthMethod.OAUTH,
+    AuthMethod.LOGIN_REDIRECT,
+    AuthMethod.NONE,
+    AuthMethod.UNKNOWN,
+)
+
+
+def _collapse_host_verdict(verdicts: set[AuthMethod]) -> AuthMethod | None:
+    """Pick the single headline AuthMethod for a host from the distinct verdicts
+    seen across its probed URLs, by _VERDICT_PRECEDENCE. Returns None when there
+    are no auth verdicts (e.g. every probe hit a transport error)."""
+    for method in _VERDICT_PRECEDENCE:
+        if method in verdicts:
+            return method
+    return None
+
 
 def write_results(
     sources: list[ConfigSource],
@@ -1132,6 +1160,36 @@ def write_results(
         if host:
             hosts.add(host)
 
+    # Per-host roll-up of the auth probes: one collapsed verdict per host,
+    # restricted to hosts that passed DNS resolution (full inventory minus the
+    # DNS failures). The verdict is the highest-precedence AuthMethod seen
+    # across the host's probed URLs (see _VERDICT_PRECEDENCE); `mixed` flags a
+    # host whose URLs disagreed, and `unreachable` counts URLs that resolved but
+    # failed to probe (transport error), so a DNS-OK-but-dead service isn't
+    # misread as "no auth".
+    unresolved_set = {e["host"] for e in unresolved} if unresolved else set()
+    resolved_hosts = {h for h in hosts if h not in unresolved_set}
+
+    host_verdicts: dict[str, list[AuthMethod | None]] = {}
+    if auth_map:
+        for url, info in auth_map.items():
+            host = urlparse(url).hostname
+            if not host:
+                continue
+            method = info.probe_result.detected_method if info.probe_result else None
+            host_verdicts.setdefault(host, []).append(method)
+
+    hosts_section: dict = {}
+    for host in sorted(resolved_hosts):
+        verdicts = host_verdicts.get(host, [])
+        auth_verdicts = {m for m in verdicts if m is not None}
+        hosts_section[host] = {
+            "auth_method": _collapse_host_verdict(auth_verdicts),
+            "mixed": len(auth_verdicts) > 1,
+            "urls_probed": len(verdicts),
+            "unreachable": sum(1 for m in verdicts if m is None),
+        }
+
     suspect_urls = [
         {"url": url, "reason": entry["reason"], "sources": entry["sources"]}
         for url, entry in sorted(suspect_index.items())
@@ -1139,11 +1197,11 @@ def write_results(
 
     output: dict = {
         "sources": entries,
-        "unique_hosts": sorted(hosts),
         "suspect_urls": suspect_urls,
     }
 
     if unresolved is not None:
+        output["hosts"] = hosts_section
         output["unresolved_hosts"] = unresolved
 
     if auth_map:
