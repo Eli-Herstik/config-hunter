@@ -1101,13 +1101,21 @@ async def test_probe_unreachable_url():
 
 
 @pytest.mark.asyncio
-async def test_probe_bad_request_no_root_probe(auth_server):
-    """400 is a protocol error, not an auth signal -> no root probe, verdict kept."""
+async def test_probe_bad_request_probes_root_no_breadcrumb(auth_server):
+    """400 (rejected before auth could be read) triggers a root probe so the
+    host's front door is still mapped — but gets NO breadcrumb, since "host root
+    discloses X" on a malformed-request path is an unfounded inference. The path
+    keeps its own verdict."""
     path_probes, root_probes = await probe_urls_with_roots(
         [f"{auth_server}/auth/bad-request"], timeout=5.0)
     assert path_probes[0].status_code == 400
     assert path_probes[0].detected_method == "unknown"
-    assert root_probes == []
+    # root probed, front door learned as an independent fact (/ is open -> none)
+    assert len(root_probes) == 1
+    assert root_probes[0].url.endswith("/")
+    assert root_probes[0].detected_method == "none"
+    # but no breadcrumb tying the 400 path to that root
+    assert "host root" not in (path_probes[0].note or "")
 
 
 @pytest.mark.asyncio
@@ -1175,14 +1183,17 @@ class TestHostRootUrl:
 
 
 @pytest.mark.asyncio
-async def test_probe_subpath_400_no_root_probe(auth_server):
-    """A 400 on a deep path doesn't trigger a root probe (400 carries no auth
-    signal); the path keeps its own verdict."""
+async def test_probe_subpath_400_probes_root_no_breadcrumb(auth_server):
+    """A 400 on a deep path triggers a probe of the host root (not the path's own
+    parent) so the front door is mapped; the path keeps its verdict and gets no
+    breadcrumb."""
     path_probes, root_probes = await probe_urls_with_roots(
         [f"{auth_server}/api-gated/v1/data"], timeout=5.0)
     assert path_probes[0].status_code == 400
     assert path_probes[0].detected_method == "unknown"
-    assert root_probes == []
+    assert len(root_probes) == 1
+    assert root_probes[0].url.endswith("/")
+    assert "host root" not in (path_probes[0].note or "")
 
 
 @pytest.mark.asyncio

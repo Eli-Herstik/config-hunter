@@ -280,9 +280,17 @@ async def probe_urls_with_roots(
     cookies: dict[str, str] | None = None,
     headers: dict[str, str] | None = None,
 ) -> tuple[list[ProbeResult], list[ProbeResult]]:
-    """Probe `urls`, then for any host with a path that returned an undisclosed
-    auth challenge (401/403, scheme not named) probe that host's root once to
-    try to disclose the scheme.
+    """Probe `urls`, then for any host with a path we couldn't read (400/401/403,
+    scheme not named) probe that host's root once to try to disclose the scheme.
+
+    The root probe fires on three statuses but they mean different things:
+    401/403 establish "this path is gated, scheme undisclosed" — so we also drop
+    a breadcrumb linking the path to the front door that explains it. A 400
+    ("rejected before auth could be evaluated" — WAF, wrong verb/content-type,
+    SNI) establishes no such thing about the path, so it triggers the root probe
+    (the host is alive and its front door is a useful fact) but gets NO
+    breadcrumb — "host root discloses X" on a malformed-request path would be an
+    unfounded inference.
 
     Returns (path_probes, root_probes). root_probes are for synthesized
     host-root URLs not already in `urls`, filtered to those that disclosed
@@ -293,11 +301,17 @@ async def probe_urls_with_roots(
               cookies=cookies, headers=headers)
     path_probes = await probe_urls(urls, **kw)
 
+    def triggers_root(p: ProbeResult) -> bool:
+        return p.status_code in (400, 401, 403) and p.detected_method is AuthMethod.UNKNOWN
+
+    def gets_breadcrumb(p: ProbeResult) -> bool:
+        return p.status_code in (401, 403) and p.detected_method is AuthMethod.UNKNOWN
+
     probed = set(urls)
     roots: list[str] = []
     seen: set[str] = set()
     for p in path_probes:
-        if p.status_code in (401, 403) and p.detected_method is AuthMethod.UNKNOWN:
+        if triggers_root(p):
             root = _host_root_url(p.url)
             if root and root not in probed and root not in seen:
                 seen.add(root)
@@ -310,12 +324,12 @@ async def probe_urls_with_roots(
                        if r.detected_method is not None
                        and r.detected_method is not AuthMethod.UNKNOWN]
 
-    # Breadcrumb: point each undisclosed path at the front door that explains
-    # it, since once the root is a separate entry nothing else links them in the
-    # per-URL view.
+    # Breadcrumb: point each undisclosed *gated* path (401/403) at the front door
+    # that explains it, since once the root is a separate entry nothing else links
+    # them in the per-URL view. 400 paths trigger the probe but get no breadcrumb.
     disclosed = {urlparse(r.url).hostname: r.detected_method for r in root_probes}
     for p in path_probes:
-        if p.status_code in (401, 403) and p.detected_method is AuthMethod.UNKNOWN:
+        if gets_breadcrumb(p):
             m = disclosed.get(urlparse(p.url).hostname)
             if m is not None:
                 hint = ("; host root is open (none)" if m is AuthMethod.NONE
