@@ -76,6 +76,12 @@ class AuthInfo:
     """Auth info for a single URL, derived from HTTP probing."""
     url: str
     probe_result: ProbeResult | None = None
+    # True when this entry is a host root we probed on our own initiative — no
+    # config referenced it — to disclose the scheme behind a 401/403 path that
+    # gave no WWW-Authenticate. Kept distinct so the output never implies the
+    # app referenced `/` when it didn't. NOT load-bearing for the host-verdict
+    # collapse (the precedence order handles masking); purely provenance.
+    synthesized: bool = False
 
 
 # ---------------------------------------------------------------------------
@@ -224,38 +230,12 @@ async def _probe_single(
     semaphore: asyncio.Semaphore,
     timeout: float,
 ) -> ProbeResult:
-    """Probe a single URL for auth requirements."""
+    """Probe a single URL for auth requirements. Returns the path's own verdict;
+    host-root enrichment is handled separately by probe_urls_with_roots."""
     async with semaphore:
         try:
             status, www_auth, location, reason = await _do_probe_request(session, url, timeout)
             method, note = _classify_probe(status, www_auth, location, url, reason)
-
-            # On 400/403/404, the specific path may not work or may block
-            # unauthenticated requests — the host root can still reveal
-            # the service's auth requirements more clearly. But if the path
-            # itself returned a WWW-Authenticate challenge, that's already the
-            # authoritative answer (e.g. OAuth 403 insufficient_scope) and the
-            # root probe would only overwrite it with a weaker signal.
-            if status in (400, 403, 404) and not www_auth:
-                root = _host_root_url(url)
-                if root:
-                    try:
-                        root_status, root_www_auth, root_location, root_reason = await _do_probe_request(session, root, timeout)
-                        root_method, root_note = _classify_probe(root_status, root_www_auth, root_location, root, root_reason)
-                        # Use the root result only if it actually identified an
-                        # auth method. An UNKNOWN root tells us nothing the
-                        # path's own outcome didn't already.
-                        if root_method is not AuthMethod.UNKNOWN:
-                            return ProbeResult(
-                                url=url,
-                                status_code=root_status,
-                                www_authenticate=root_www_auth,
-                                detected_method=root_method,
-                                note=root_note,
-                            )
-                    except Exception:
-                        pass  # root fallback failed, keep original result
-
             return ProbeResult(
                 url=url,
                 status_code=status,
@@ -292,11 +272,77 @@ async def probe_urls(
         return await asyncio.gather(*tasks)
 
 
+async def probe_urls_with_roots(
+    urls: list[str],
+    *,
+    timeout: float = 5.0,
+    max_concurrent: int = 10,
+    cookies: dict[str, str] | None = None,
+    headers: dict[str, str] | None = None,
+) -> tuple[list[ProbeResult], list[ProbeResult]]:
+    """Probe `urls`, then for any host with a path that returned an undisclosed
+    auth challenge (401/403, scheme not named) probe that host's root once to
+    try to disclose the scheme.
+
+    Returns (path_probes, root_probes). root_probes are for synthesized
+    host-root URLs not already in `urls`, filtered to those that disclosed
+    something useful (a concrete scheme, or NONE = 'front door open'); UNKNOWN
+    or errored roots add nothing and are dropped. The path keeps its own
+    verdict — the root is never substituted into it."""
+    kw = dict(timeout=timeout, max_concurrent=max_concurrent,
+              cookies=cookies, headers=headers)
+    path_probes = await probe_urls(urls, **kw)
+
+    probed = set(urls)
+    roots: list[str] = []
+    seen: set[str] = set()
+    for p in path_probes:
+        if p.status_code in (401, 403) and p.detected_method is AuthMethod.UNKNOWN:
+            root = _host_root_url(p.url)
+            if root and root not in probed and root not in seen:
+                seen.add(root)
+                roots.append(root)
+
+    root_probes: list[ProbeResult] = []
+    if roots:
+        raw = await probe_urls(roots, **kw)
+        root_probes = [r for r in raw
+                       if r.detected_method is not None
+                       and r.detected_method is not AuthMethod.UNKNOWN]
+
+    # Breadcrumb: point each undisclosed path at the front door that explains
+    # it, since once the root is a separate entry nothing else links them in the
+    # per-URL view.
+    disclosed = {urlparse(r.url).hostname: r.detected_method for r in root_probes}
+    for p in path_probes:
+        if p.status_code in (401, 403) and p.detected_method is AuthMethod.UNKNOWN:
+            m = disclosed.get(urlparse(p.url).hostname)
+            if m is not None:
+                hint = ("; host root is open (none)" if m is AuthMethod.NONE
+                        else f"; host root discloses {m.value}")
+                p.note = (p.note or "") + hint
+    return path_probes, root_probes
+
+
 def merge_probe_results(auth_map: dict[str, AuthInfo], probes: list[ProbeResult]) -> None:
     """Merge probe results into the auth map."""
     for probe in probes:
         if probe.url in auth_map:
             auth_map[probe.url].probe_result = probe
+
+
+def merge_root_probes(auth_map: dict[str, AuthInfo], root_probes: list[ProbeResult]) -> None:
+    """Insert host-root probes as new auth_map entries. If the root URL is
+    already a key, the config genuinely referenced it — fold the probe in and
+    leave `synthesized` False, so a discovered root is treated like any other
+    discovered URL."""
+    for probe in root_probes:
+        existing = auth_map.get(probe.url)
+        if existing is None:
+            auth_map[probe.url] = AuthInfo(
+                url=probe.url, probe_result=probe, synthesized=True)
+        elif existing.probe_result is None:
+            existing.probe_result = probe
 
 
 # ---------------------------------------------------------------------------
@@ -1155,8 +1201,13 @@ _VERDICT_PRECEDENCE: tuple[AuthMethod, ...] = (
     AuthMethod.OTHER,
     AuthMethod.OAUTH,
     AuthMethod.LOGIN_REDIRECT,
-    AuthMethod.NONE,
+    # UNKNOWN outranks NONE on purpose: a path we couldn't clear (401/403,
+    # scheme undisclosed) is the thing a reader must look at before exposure.
+    # If NONE won, one open endpoint (often the host root) would mask a
+    # restricted sibling in the host headline — the false negative this scan
+    # exists to catch. A concrete scheme still outranks both.
     AuthMethod.UNKNOWN,
+    AuthMethod.NONE,
 )
 
 
@@ -1261,6 +1312,8 @@ def write_results(
         auth_section: dict = {}
         for url, info in sorted(auth_map.items()):
             entry: dict = {}
+            if info.synthesized:
+                entry["synthesized"] = True
             if info.probe_result:
                 p = info.probe_result
                 entry["probe"] = {
@@ -1406,14 +1459,17 @@ def main() -> None:
         skipped = len(unique_urls) - len(probeable_urls)
         skip_msg = f" (skipping {skipped} on unresolved hosts)" if skipped else ""
         print(f"Probing {len(probeable_urls)} URLs for authentication methods...{skip_msg}")
-        probes = asyncio.run(probe_urls(
+        path_probes, root_probes = asyncio.run(probe_urls_with_roots(
             probeable_urls,
             timeout=float(args.probe_timeout),
             max_concurrent=args.probe_concurrency,
             cookies=probe_cookies or None,
             headers=cli_headers or None,
         ))
-        merge_probe_results(auth_map, probes)
+        merge_probe_results(auth_map, path_probes)
+        merge_root_probes(auth_map, root_probes)
+        if root_probes:
+            print(f"  probed {len(root_probes)} host root(s) to disclose undisclosed auth")
 
     if args.output:
         write_results(sources, args.output, auth_map, unresolved, ip_map)

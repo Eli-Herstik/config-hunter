@@ -9,7 +9,7 @@ A Playwright-based crawler that loads a web app, captures the JSON configs and J
 3. **DOM scan** — Reads `<script type="application/json">` blocks, inline global assignments (`window.__CONFIG = {…}`), and referenced `*.json` assets.
 4. **Manifest probe** — Tries well-known build manifest paths (`/asset-manifest.json`, `/manifest.json`, `/.vite/manifest.json`, …) and pulls referenced chunks as text.
 5. **Extract** — Recursively walks parsed JSON and falls back to a regex over raw text. JS-object syntax (single quotes, trailing commas, comments) is sanitized before parsing.
-6. **Probe** — Issues a `HEAD` (with `GET` fallback on 405) to each discovered URL and classifies the response by status code and `WWW-Authenticate` header. On 400/403/404 it retries against the host root, since the specific path may block unauthenticated requests while the root reveals the real auth challenge.
+6. **Probe** — Issues a `HEAD` (with `GET` fallback on 405) to each discovered URL and classifies the response by status code and `WWW-Authenticate` header. On 403/401 it retries against the host root, since the specific path may block unauthenticated requests while the root reveals the real auth challenge.
 
 ## Install
 
@@ -68,7 +68,6 @@ A time-budgeted pass of safe scrolls, hovers, and clicks runs on every page to s
 | `--wait-after-load MS` | Extra idle wait for late XHRs (default 5000) |
 | `--follow-links` | Discover same-origin `a[href]` and crawl them |
 | `--max-pages N` | Cap pages visited (default 1) |
-| `--cross-origin` | Allow `--follow-links` to leave the seed origin |
 | `--interact-budget MS` | Per-page interaction budget (default 8000) |
 | `--probe-timeout S` / `--probe-concurrency N` | Tune the auth-probe pass |
 | `--login` / `--save-storage PATH` | Headed manual-login capture mode |

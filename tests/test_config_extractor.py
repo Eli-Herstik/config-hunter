@@ -32,7 +32,10 @@ from config_extractor import (
     AuthMethod,
     _host_root_url,
     probe_urls,
+    probe_urls_with_roots,
     merge_probe_results,
+    merge_root_probes,
+    _collapse_host_verdict,
     resolve_hosts,
     _parse_www_authenticate,
     _classify_probe,
@@ -1053,13 +1056,21 @@ async def test_probe_no_auth(auth_server):
 
 
 @pytest.mark.asyncio
-async def test_probe_forbidden_with_fallback(auth_server):
-    """403 on a path triggers host-root fallback; root (/) returns 200 → none."""
-    results = await probe_urls([f"{auth_server}/auth/forbidden"], timeout=5.0)
-    assert len(results) == 1
-    # Fallback to host root which returns 200
-    assert results[0].status_code == 200
-    assert results[0].detected_method == "none"
+async def test_probe_forbidden_keeps_verdict_and_probes_root(auth_server):
+    """403 with no challenge keeps its own (unknown) verdict; the host root is
+    probed separately and returned as an independent result, not substituted."""
+    path_probes, root_probes = await probe_urls_with_roots(
+        [f"{auth_server}/auth/forbidden"], timeout=5.0)
+    assert len(path_probes) == 1
+    assert path_probes[0].status_code == 403          # NOT overwritten by root
+    assert path_probes[0].detected_method == "unknown"
+    # root (/) returns 200 -> none, kept as a separate synthesized probe
+    assert len(root_probes) == 1
+    assert root_probes[0].url == f"{auth_server}/"
+    assert root_probes[0].status_code == 200
+    assert root_probes[0].detected_method == "none"
+    # breadcrumb links the locked path to the open front door
+    assert "host root is open" in path_probes[0].note
 
 
 @pytest.mark.asyncio
@@ -1090,23 +1101,23 @@ async def test_probe_unreachable_url():
 
 
 @pytest.mark.asyncio
-async def test_probe_bad_request_with_fallback(auth_server):
-    """400 on a path triggers host-root fallback; root (/) returns 200 → none."""
-    results = await probe_urls([f"{auth_server}/auth/bad-request"], timeout=5.0)
-    assert len(results) == 1
-    # Fallback to host root which returns 200
-    assert results[0].status_code == 200
-    assert results[0].detected_method == "none"
+async def test_probe_bad_request_no_root_probe(auth_server):
+    """400 is a protocol error, not an auth signal -> no root probe, verdict kept."""
+    path_probes, root_probes = await probe_urls_with_roots(
+        [f"{auth_server}/auth/bad-request"], timeout=5.0)
+    assert path_probes[0].status_code == 400
+    assert path_probes[0].detected_method == "unknown"
+    assert root_probes == []
 
 
 @pytest.mark.asyncio
-async def test_probe_not_found_with_fallback(auth_server):
-    """404 on a path triggers host-root fallback; root (/) returns 200 → none."""
-    results = await probe_urls([f"{auth_server}/auth/not-found"], timeout=5.0)
-    assert len(results) == 1
-    # Fallback to host root which returns 200
-    assert results[0].status_code == 200
-    assert results[0].detected_method == "none"
+async def test_probe_not_found_no_root_probe(auth_server):
+    """404 is a dead path -> no root probe, verdict kept."""
+    path_probes, root_probes = await probe_urls_with_roots(
+        [f"{auth_server}/auth/not-found"], timeout=5.0)
+    assert path_probes[0].status_code == 404
+    assert path_probes[0].detected_method == "unknown"
+    assert root_probes == []
 
 
 @pytest.mark.asyncio
@@ -1164,24 +1175,51 @@ class TestHostRootUrl:
 
 
 @pytest.mark.asyncio
-async def test_probe_bad_request_falls_back_to_host_root(auth_server):
-    """When a path returns 400, probe should retry at host root and use that result."""
-    results = await probe_urls([f"{auth_server}/api-gated/v1/data"], timeout=5.0)
-    assert len(results) == 1
-    # The path returns 400, but the root fallback hits /api-gated/ which isn't
-    # the host root — it falls back to host root (/) which serves HTML (200).
-    # Since the host root returns 200, that's more informative than 400.
-    # The result should NOT be "bad_request" since fallback found something better.
-    assert results[0].detected_method != "bad_request"
+async def test_probe_subpath_400_no_root_probe(auth_server):
+    """A 400 on a deep path doesn't trigger a root probe (400 carries no auth
+    signal); the path keeps its own verdict."""
+    path_probes, root_probes = await probe_urls_with_roots(
+        [f"{auth_server}/api-gated/v1/data"], timeout=5.0)
+    assert path_probes[0].status_code == 400
+    assert path_probes[0].detected_method == "unknown"
+    assert root_probes == []
 
 
 @pytest.mark.asyncio
-async def test_probe_bad_request_no_fallback_when_root_only(auth_server):
-    """When URL is already at root, no fallback occurs — stays bad_request."""
-    # Probe just the host root directly — _host_root_url returns None for root URLs
-    # so we need a URL that returns 400 and has no useful root fallback.
-    # We simulate this by testing _host_root_url returns None for the root.
+async def test_probe_no_root_probe_when_root_only(auth_server):
+    """When the URL is already the host root, there's no higher root to consult
+    — _host_root_url returns None, so no root probe is synthesized."""
     assert _host_root_url(f"{auth_server}/") is None
+
+
+def test_collapse_unknown_outranks_none():
+    """An open endpoint (often the host root) must never mask a locked-but-
+    undisclosed sibling in the host headline; a concrete scheme still wins."""
+    assert _collapse_host_verdict(
+        {AuthMethod.UNKNOWN, AuthMethod.NONE}) == AuthMethod.UNKNOWN
+    assert _collapse_host_verdict(
+        {AuthMethod.BASIC, AuthMethod.UNKNOWN, AuthMethod.NONE}) == AuthMethod.BASIC
+
+
+def test_merge_root_probes_inserts_synthesized():
+    """A probed root that no config referenced is inserted as a synthesized entry."""
+    auth_map = {"https://h/x": AuthInfo(url="https://h/x")}
+    root = ProbeResult(url="https://h/", status_code=200, www_authenticate=None,
+                       detected_method=AuthMethod.NONE)
+    merge_root_probes(auth_map, [root])
+    assert auth_map["https://h/"].synthesized is True
+    assert auth_map["https://h/"].probe_result.detected_method == AuthMethod.NONE
+
+
+def test_merge_root_probes_keeps_discovered_root_unmarked():
+    """A root the config already referenced is folded in WITHOUT the synthesized
+    mark — it's a genuine discovered URL, not one we invented."""
+    auth_map = {"https://h/": AuthInfo(url="https://h/")}  # discovered, unprobed
+    root = ProbeResult(url="https://h/", status_code=401, www_authenticate="Basic",
+                       detected_method=AuthMethod.BASIC)
+    merge_root_probes(auth_map, [root])
+    assert auth_map["https://h/"].synthesized is False
+    assert auth_map["https://h/"].probe_result.detected_method == AuthMethod.BASIC
 
 
 @pytest.mark.asyncio
