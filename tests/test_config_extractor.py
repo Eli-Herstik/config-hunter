@@ -31,6 +31,7 @@ from config_extractor import (
     ProbeResult,
     AuthMethod,
     _host_root_url,
+    _service_key,
     probe_urls,
     probe_urls_with_roots,
     merge_probe_results,
@@ -576,10 +577,11 @@ def _auth_info(url, method, *, status=200, note=None, error=None):
     )
 
 
-def test_write_results_hosts_map_collapses_and_filters(tmp_path):
-    """The hosts map lists only resolved hosts, collapses each host's per-URL
-    verdicts by precedence (concrete scheme > none), flags disagreement with
-    `mixed`, and counts probe transport errors as `unreachable`."""
+def test_write_results_services_map_collapses_and_filters(tmp_path):
+    """The services map lists only services whose host resolved, collapses each
+    service's per-URL verdicts by precedence (concrete scheme > none), flags
+    disagreement with `mixed`, and counts probe transport errors as
+    `unreachable`. Keys are origins; `ips` are joined through the hostname."""
     sources = [ConfigSource(
         origin="js: https://app/bundle.js",
         urls_found=[
@@ -610,12 +612,12 @@ def test_write_results_hosts_map_collapses_and_filters(tmp_path):
     with open(out, "r", encoding="utf-8") as f:
         data = json.load(f)
 
-    hosts = data["hosts"]
-    assert set(hosts) == {"svc.example.com", "down.example.com"}
-    assert "dead.example.com" not in hosts  # excluded: failed DNS resolution
+    services = data["services"]
+    assert set(services) == {"https://svc.example.com", "https://down.example.com"}
+    assert "https://dead.example.com" not in services  # excluded: failed DNS
 
-    svc = hosts["svc.example.com"]
-    assert svc["ips"] == ["10.0.0.5"]
+    svc = services["https://svc.example.com"]
+    assert svc["ips"] == ["10.0.0.5"]  # joined through the hostname
     assert svc["auth_method"] == "bearer"  # concrete scheme outranks none
     assert svc["status_codes"] == [200, 401]  # distinct, sorted
     # notes: keyed by the URL that carried one; the note-less `/` is absent
@@ -624,7 +626,7 @@ def test_write_results_hosts_map_collapses_and_filters(tmp_path):
     assert svc["urls_probed"] == 2
     assert svc["unreachable"] == 0
 
-    down = hosts["down.example.com"]
+    down = services["https://down.example.com"]
     assert down["ips"] == ["10.0.0.6", "10.0.0.7"]  # multiple IPs preserved
     assert down["auth_method"] is None     # only a transport error, no verdict
     assert down["status_codes"] == []      # transport error carries no status
@@ -634,8 +636,8 @@ def test_write_results_hosts_map_collapses_and_filters(tmp_path):
     assert down["unreachable"] == 1
 
 
-def test_write_results_omits_hosts_map_without_resolution(tmp_path):
-    """No DNS-resolution pass (unresolved is None) -> no `hosts` map, since
+def test_write_results_omits_services_map_without_resolution(tmp_path):
+    """No DNS-resolution pass (unresolved is None) -> no `services` map, since
     'passed DNS resolution' is undefined."""
     sources = [ConfigSource(
         origin="js: https://app/bundle.js",
@@ -645,7 +647,56 @@ def test_write_results_omits_hosts_map_without_resolution(tmp_path):
     write_results(sources, str(out))
     with open(out, "r", encoding="utf-8") as f:
         data = json.load(f)
-    assert "hosts" not in data
+    assert "services" not in data
+
+
+def test_write_results_keys_services_by_origin(tmp_path):
+    """Two ports on one host are distinct services; http vs https are distinct;
+    the scheme's default port collapses into the bare origin; and `ips` are
+    shared across services on the same hostname."""
+    sources = [ConfigSource(
+        origin="js: https://app/bundle.js",
+        urls_found=[
+            "https://svc.example.com/api",        # https default (:443)
+            "https://svc.example.com:443/admin",  # same service as above
+            "https://svc.example.com:8080/x",     # distinct: non-default port
+            "http://svc.example.com/y",            # distinct: different scheme
+        ],
+    )]
+    auth_map = {
+        "https://svc.example.com/api": _auth_info(
+            "https://svc.example.com/api", AuthMethod.NEGOTIATE, status=401),
+        "https://svc.example.com:443/admin": _auth_info(
+            "https://svc.example.com:443/admin", AuthMethod.NEGOTIATE, status=401),
+        "https://svc.example.com:8080/x": _auth_info(
+            "https://svc.example.com:8080/x", AuthMethod.NONE),
+        "http://svc.example.com/y": _auth_info(
+            "http://svc.example.com/y", AuthMethod.BASIC, status=401),
+    }
+    unresolved: list[dict] = []
+    ip_map = {"svc.example.com": ["10.0.0.5"]}
+
+    out = tmp_path / "r.json"
+    write_results(sources, str(out), auth_map, unresolved, ip_map)
+    with open(out, "r", encoding="utf-8") as f:
+        data = json.load(f)
+
+    services = data["services"]
+    assert set(services) == {
+        "https://svc.example.com",        # :443 folded in with the default
+        "https://svc.example.com:8080",
+        "http://svc.example.com",
+    }
+    # The :443 URL collapsed into the bare https origin, not its own row.
+    https_default = services["https://svc.example.com"]
+    assert https_default["urls_probed"] == 2
+    assert https_default["auth_method"] == "negotiate"
+    assert https_default["mixed"] is False
+    # Distinct port and distinct scheme keep their own verdicts.
+    assert services["https://svc.example.com:8080"]["auth_method"] == "none"
+    assert services["http://svc.example.com"]["auth_method"] == "basic"
+    # All three share the one hostname's resolved IPs.
+    assert all(s["ips"] == ["10.0.0.5"] for s in services.values())
 
 
 @pytest.mark.asyncio
@@ -1180,6 +1231,34 @@ class TestHostRootUrl:
 
     def test_url_no_path(self):
         assert _host_root_url("https://api.example.com") is None
+
+
+class TestServiceKey:
+    def test_strips_path_and_query(self):
+        assert _service_key("https://h.example.com/v1/data?x=1") == "https://h.example.com"
+
+    def test_default_https_port_stripped(self):
+        # The bare origin and the explicit default port name one service.
+        assert _service_key("https://h.example.com:443/x") == "https://h.example.com"
+
+    def test_default_http_port_stripped(self):
+        assert _service_key("http://h.example.com:80/x") == "http://h.example.com"
+
+    def test_non_default_port_kept(self):
+        assert _service_key("https://h.example.com:8080/x") == "https://h.example.com:8080"
+
+    def test_scheme_distinguishes(self):
+        assert _service_key("http://h.example.com/x") != _service_key("https://h.example.com/x")
+
+    def test_host_lowercased(self):
+        assert _service_key("https://H.Example.COM/x") == "https://h.example.com"
+
+    def test_no_host_returns_none(self):
+        assert _service_key("not-a-url") is None
+
+    def test_out_of_range_port_treated_as_unspecified(self):
+        # Accessing urlparse(...).port raises on a 99999 port; we swallow it.
+        assert _service_key("http://h.example.com:99999/x") == "http://h.example.com"
 
 
 @pytest.mark.asyncio

@@ -1235,6 +1235,30 @@ def _collapse_host_verdict(verdicts: set[AuthMethod]) -> AuthMethod | None:
     return None
 
 
+_DEFAULT_PORTS = {"http": 80, "https": 443}
+
+
+def _service_key(url: str) -> str | None:
+    """Normalize a URL to its origin (scheme://host[:port]) — the identity we
+    roll auth verdicts up by. On an internal estate a hostname is not a service:
+    two ports on one box, or http vs https, are usually distinct services with
+    their own auth, and collapsing them by bare hostname would hide a gated
+    sibling behind an open one. The scheme's default port is stripped so
+    https://h and https://h:443 (and http://h / http://h:80) name one service,
+    not two. Returns None if the URL has no host."""
+    parsed = urlparse(url)
+    host = parsed.hostname
+    if not host:
+        return None
+    try:
+        port = parsed.port
+    except ValueError:  # out-of-range port; treat as unspecified
+        port = None
+    if port is not None and port != _DEFAULT_PORTS.get(parsed.scheme):
+        return f"{parsed.scheme}://{host}:{port}"
+    return f"{parsed.scheme}://{host}"
+
+
 def write_results(
     sources: list[ConfigSource],
     path: str,
@@ -1258,46 +1282,52 @@ def write_results(
             if src.origin not in entry["sources"]:
                 entry["sources"].append(src.origin)
 
-    hosts: set[str] = set()
+    services: set[str] = set()
     for u in all_clean:
-        host = urlparse(u).hostname
-        if host:
-            hosts.add(host)
+        svc = _service_key(u)
+        if svc:
+            services.add(svc)
 
-    # Per-host roll-up of the auth probes: one collapsed verdict per host,
-    # restricted to hosts that passed DNS resolution (full inventory minus the
-    # DNS failures). `ips` is the distinct resolved addresses (IPv4 + IPv6,
-    # sorted) from the DNS pass — a host can map to several (round-robin DNS,
-    # load balancers, dual-stack), and shared IPs across hostnames reveal a
-    # common backend. `auth_method` is the highest-precedence AuthMethod seen
-    # across the host's probed URLs (see _VERDICT_PRECEDENCE); `status_codes`
-    # lists the distinct HTTP statuses observed — the evidence behind the
-    # verdict, and what disambiguates an `unknown` host (403 vs 404 vs 503);
-    # `notes` maps each probed URL that carried an inconclusive/coarse note to
-    # that note (the scheme behind an `other`, a redirect target, why a method
-    # couldn't be pinned) — the host-scoped view the flat `auth` section can't
-    # give, and which endpoint disagreed when `mixed`; `mixed` flags a host
-    # whose URLs disagreed; and `unreachable` counts URLs that resolved but
-    # failed to probe (transport error, no status), so a DNS-OK-but-dead service
-    # isn't misread as "no auth".
+    # Per-service roll-up of the auth probes: one collapsed verdict per service,
+    # where a service is an origin (scheme://host[:port], default port stripped —
+    # see _service_key), not a bare hostname, so two ports on one box or http vs
+    # https don't merge. Restricted to services whose host passed DNS resolution
+    # (full inventory minus the DNS failures). DNS has no notion of port, so the
+    # resolution check and `ips` are looked up through the service's *hostname*
+    # component: `ips` is the distinct resolved addresses (IPv4 + IPv6, sorted)
+    # for that host — it can map to several (round-robin DNS, load balancers,
+    # dual-stack), and shared IPs across services reveal a common backend.
+    # `auth_method` is the highest-precedence AuthMethod seen across the
+    # service's probed URLs (see _VERDICT_PRECEDENCE); `status_codes` lists the
+    # distinct HTTP statuses observed — the evidence behind the verdict, and what
+    # disambiguates an `unknown` service (403 vs 404 vs 503); `notes` maps each
+    # probed URL that carried an inconclusive/coarse note to that note (the
+    # scheme behind an `other`, a redirect target, why a method couldn't be
+    # pinned) — the service-scoped view the flat `auth` section can't give, and
+    # which endpoint disagreed when `mixed`; `mixed` flags a service whose URLs
+    # disagreed; and `unreachable` counts URLs that resolved but failed to probe
+    # (transport error, no status), so a DNS-OK-but-dead service isn't misread as
+    # "no auth".
     unresolved_set = {e["host"] for e in unresolved} if unresolved else set()
-    resolved_hosts = {h for h in hosts if h not in unresolved_set}
+    resolved_services = {s for s in services
+                         if urlparse(s).hostname not in unresolved_set}
 
-    host_probes: dict[str, list[tuple[str, ProbeResult | None]]] = {}
+    service_probes: dict[str, list[tuple[str, ProbeResult | None]]] = {}
     if auth_map:
         for url, info in auth_map.items():
-            host = urlparse(url).hostname
-            if not host:
+            svc = _service_key(url)
+            if not svc:
                 continue
-            host_probes.setdefault(host, []).append((url, info.probe_result))
+            service_probes.setdefault(svc, []).append((url, info.probe_result))
 
-    hosts_section: dict = {}
-    for host in sorted(resolved_hosts):
-        probes = host_probes.get(host, [])
+    services_section: dict = {}
+    for svc in sorted(resolved_services):
+        probes = service_probes.get(svc, [])
         auth_verdicts = {p.detected_method for _, p in probes
                          if p and p.detected_method is not None}
-        hosts_section[host] = {
-            "ips": (ip_map or {}).get(host, []),
+        hostname = urlparse(svc).hostname
+        services_section[svc] = {
+            "ips": (ip_map or {}).get(hostname, []),
             "auth_method": _collapse_host_verdict(auth_verdicts),
             "status_codes": sorted({p.status_code for _, p in probes
                                     if p and p.status_code is not None}),
@@ -1319,7 +1349,7 @@ def write_results(
     }
 
     if unresolved is not None:
-        output["hosts"] = hosts_section
+        output["services"] = services_section
         output["unresolved_hosts"] = unresolved
 
     if auth_map:

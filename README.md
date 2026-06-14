@@ -62,7 +62,7 @@ A time-budgeted pass of safe scrolls, hovers, and clicks runs on every page to s
 
 | Flag | Purpose |
 |---|---|
-| `-o, --output PATH` | Write JSON report (sources, hosts, auth verdicts) |
+| `-o, --output PATH` | Write JSON report (sources, services, auth verdicts) |
 | `--headed` | Show the browser window |
 | `--timeout MS` | Navigation timeout (default 30000) |
 | `--wait-after-load MS` | Extra idle wait for late XHRs (default 5000) |
@@ -77,7 +77,10 @@ A time-budgeted pass of safe scrolls, hovers, and clicks runs on every page to s
 
 ## Output
 
-The console report lists each config source (network response, DOM script, JS chunk), the URLs extracted from it, the unique host set, and an "Authentication Analysis" section with a per-URL probe result and verdict (`basic`, `bearer`, `negotiate`, `oauth`, `none`, `unknown`, …). With `-o`, the same data is written as JSON, including an `unresolved_hosts` array — hosts referenced in configs that failed DNS resolution from the scanner's network position (each entry has `host` and an `error` reason such as `NXDOMAIN`, `SERVFAIL`, or `timeout`). URLs on unresolved hosts are skipped during the probe pass.
+The console report lists each config source (network response, DOM script, JS chunk), the URLs extracted from it, the unique host set, and an "Authentication Analysis" section with a per-URL probe result and verdict (`basic`, `bearer`, `negotiate`, `oauth`, `none`, `unknown`, …). With `-o`, the same data is written as JSON, including:
+
+- A `services` map keyed by origin (`scheme://host[:port]`, with the scheme's default port normalized away). A service — not a bare hostname — is the unit of roll-up: two ports on one box, or `http` vs `https`, are treated as distinct services with their own collapsed `auth_method`, `status_codes`, and `notes`, since on an internal estate they usually are. Each entry's `ips` are the resolved addresses for the service's hostname (DNS has no port), so services sharing a host share their IPs.
+- An `unresolved_hosts` array — hosts referenced in configs that failed DNS resolution from the scanner's network position (each entry has `host` and an `error` reason such as `NXDOMAIN`, `SERVFAIL`, or `timeout`). URLs on unresolved hosts are skipped during the probe pass.
 
 ## Tests
 

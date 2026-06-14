@@ -1,0 +1,670 @@
+{
+  "sources": [
+    {
+      "source": "network: https://api.practicesoftwaretesting.com/products?page=1&between=price,1,100&is_rental=false",
+      "urls": [
+        "https://unsplash.com/@fantin",
+        "https://unsplash.com/photos/W8BNwvOvW4M",
+        "https://unsplash.com/@zanardi",
+        "https://unsplash.com/photos/I8eTuMmxIfo",
+        "https://unsplash.com/@lazycreekimages",
+        "https://unsplash.com/photos/pM9pkc9J918",
+        "https://unsplash.com/@brett_jordan",
+        "https://unsplash.com/photos/GamuDTVm02g",
+        "https://unsplash.com/@yasin",
+        "https://unsplash.com/photos/dwlxTSpfKXg",
+        "https://unsplash.com/@imattsmart",
+        "https://unsplash.com/photos/jaLaLQdkBOE",
+        "https://unsplash.com/@hocza",
+        "https://unsplash.com/photos/D3nouOYbALc",
+        "https://unsplash.com/@andrewjoegeorge",
+        "https://unsplash.com/photos/YU2mCvXR0wA",
+        "https://unsplash.com/@lanirudhreddy",
+        "https://unsplash.com/photos/3esjG-nlgyk"
+      ],
+      "error": null
+    },
+    {
+      "source": "js: https://practicesoftwaretesting.com/chunk-IDAVDH5U.js",
+      "urls": [
+        "https://jwt.io"
+      ],
+      "error": null
+    },
+    {
+      "source": "js: https://static.cloudflareinsights.com/beacon.min.js/v833ccba57c9e4d2798f2e76cebdd09a11778172276447",
+      "urls": [
+        "https://github.com/uuidjs/uuid#getrandomvalues-not-supported",
+        "https://cloudflareinsights.com/cdn-cgi/rum"
+      ],
+      "error": null
+    },
+    {
+      "source": "js: https://practicesoftwaretesting.com/chunk-2ULIWDR5.js",
+      "urls": [],
+      "error": null
+    },
+    {
+      "source": "js: https://practicesoftwaretesting.com/scripts-WL2QHKC5.js",
+      "urls": [
+        "https://getbootstrap.com/",
+        "https://github.com/twbs/bootstrap/graphs/contributors",
+        "https://github.com/twbs/bootstrap/blob/main/LICENSE",
+        "https://popper.js.org/docs/v2/"
+      ],
+      "error": null
+    },
+    {
+      "source": "js: https://practicesoftwaretesting.com/main-Y6BH7EL3.js",
+      "urls": [
+        "https://with-bugs.practicesoftwaretesting.com/#/?bug-hunting=true",
+        "https://with-bugs.practicesoftwaretesting.com",
+        "http://www.w3.org/2000/svg",
+        "https://github.com/testsmith-io/practice-software-testing",
+        "https://unsplash.com/@barnimages",
+        "https://unsplash.com/photos/t5YUoHW6zRo",
+        "https://testsmith-io.github.io/practice-software-testing/#/"
+      ],
+      "error": null
+    },
+    {
+      "source": "js: https://practicesoftwaretesting.com/chunk-5RB5B36A.js",
+      "urls": [
+        "http://www.w3.org/2000/svg"
+      ],
+      "error": null
+    },
+    {
+      "source": "js: https://practicesoftwaretesting.com/chunk-TKC3W22G.js",
+      "urls": [
+        "https://angular.dev/best-practices/security#preventing-cross-site-scripting-xss",
+        "http://www.w3.org/2000/svg",
+        "http://www.w3.org/1999/xhtml",
+        "http://www.w3.org/1999/xlink",
+        "http://www.w3.org/XML/1998/namespace",
+        "http://www.w3.org/2000/xmlns/",
+        "http://www.w3.org/1998/Math/MathML"
+      ],
+      "error": null
+    },
+    {
+      "source": "js: https://practicesoftwaretesting.com/chunk-YYISLNVE.js",
+      "urls": [
+        "https://api.practicesoftwaretesting.com"
+      ],
+      "error": null
+    }
+  ],
+  "suspect_urls": [
+    {
+      "url": "https://www.googletagmanager.com/gtag/js?id=${t",
+      "reason": "template",
+      "sources": [
+        "js: https://practicesoftwaretesting.com/chunk-2ULIWDR5.js"
+      ]
+    }
+  ],
+  "services": {
+    "http://www.w3.org": {
+      "ips": [
+        "104.18.22.19",
+        "104.18.23.19",
+        "2606:4700::6812:1613",
+        "2606:4700::6812:1713"
+      ],
+      "auth_method": "unknown",
+      "status_codes": [
+        301
+      ],
+      "notes": {
+        "http://www.w3.org/1998/Math/MathML": "redirects to https://www.w3.org/1998/Math/MathML",
+        "http://www.w3.org/1999/xhtml": "redirects to https://www.w3.org/1999/xhtml",
+        "http://www.w3.org/1999/xlink": "redirects to https://www.w3.org/1999/xlink",
+        "http://www.w3.org/2000/svg": "redirects to https://www.w3.org/2000/svg",
+        "http://www.w3.org/2000/xmlns/": "redirects to https://www.w3.org/2000/xmlns/",
+        "http://www.w3.org/XML/1998/namespace": "redirects to https://www.w3.org/XML/1998/namespace"
+      },
+      "mixed": false,
+      "urls_probed": 6,
+      "unreachable": 0
+    },
+    "https://angular.dev": {
+      "ips": [
+        "199.36.158.100"
+      ],
+      "auth_method": "none",
+      "status_codes": [
+        200
+      ],
+      "notes": {},
+      "mixed": false,
+      "urls_probed": 1,
+      "unreachable": 0
+    },
+    "https://api.practicesoftwaretesting.com": {
+      "ips": [
+        "24.144.76.208"
+      ],
+      "auth_method": "unknown",
+      "status_codes": [
+        404
+      ],
+      "notes": {
+        "https://api.practicesoftwaretesting.com": "not found (404)"
+      },
+      "mixed": false,
+      "urls_probed": 1,
+      "unreachable": 0
+    },
+    "https://cloudflareinsights.com": {
+      "ips": [
+        "104.16.79.73",
+        "104.16.80.73",
+        "2606:4700::6810:4f49",
+        "2606:4700::6810:5049"
+      ],
+      "auth_method": "unknown",
+      "status_codes": [
+        404
+      ],
+      "notes": {
+        "https://cloudflareinsights.com/cdn-cgi/rum": "not found (404)"
+      },
+      "mixed": false,
+      "urls_probed": 1,
+      "unreachable": 0
+    },
+    "https://getbootstrap.com": {
+      "ips": [
+        "104.20.26.6",
+        "172.66.169.22",
+        "2606:4700:10::6814:1a06",
+        "2606:4700:10::ac42:a916"
+      ],
+      "auth_method": "none",
+      "status_codes": [
+        200
+      ],
+      "notes": {},
+      "mixed": false,
+      "urls_probed": 1,
+      "unreachable": 0
+    },
+    "https://github.com": {
+      "ips": [
+        "20.217.135.5"
+      ],
+      "auth_method": "none",
+      "status_codes": [
+        200
+      ],
+      "notes": {},
+      "mixed": false,
+      "urls_probed": 4,
+      "unreachable": 0
+    },
+    "https://jwt.io": {
+      "ips": [
+        "104.18.32.191",
+        "172.64.155.65",
+        "2606:4700:440b::6812:20bf",
+        "2a06:98c1:3102::ac40:9b41"
+      ],
+      "auth_method": "unknown",
+      "status_codes": [
+        307
+      ],
+      "notes": {
+        "https://jwt.io": "redirects off-origin to www.jwt.io"
+      },
+      "mixed": false,
+      "urls_probed": 1,
+      "unreachable": 0
+    },
+    "https://popper.js.org": {
+      "ips": [
+        "104.26.8.84",
+        "104.26.9.84",
+        "172.67.73.64",
+        "2606:4700:20::681a:854",
+        "2606:4700:20::681a:954",
+        "2606:4700:20::ac43:4940"
+      ],
+      "auth_method": "none",
+      "status_codes": [
+        200
+      ],
+      "notes": {},
+      "mixed": false,
+      "urls_probed": 1,
+      "unreachable": 0
+    },
+    "https://testsmith-io.github.io": {
+      "ips": [
+        "185.199.108.153",
+        "185.199.109.153",
+        "185.199.110.153",
+        "185.199.111.153",
+        "2606:50c0:8000::153",
+        "2606:50c0:8001::153",
+        "2606:50c0:8002::153",
+        "2606:50c0:8003::153"
+      ],
+      "auth_method": "none",
+      "status_codes": [
+        200
+      ],
+      "notes": {},
+      "mixed": false,
+      "urls_probed": 1,
+      "unreachable": 0
+    },
+    "https://unsplash.com": {
+      "ips": [
+        "151.101.1.181",
+        "151.101.129.181",
+        "151.101.193.181",
+        "151.101.65.181"
+      ],
+      "auth_method": "unknown",
+      "status_codes": [
+        403
+      ],
+      "notes": {
+        "https://unsplash.com/@andrewjoegeorge": "forbidden (403)",
+        "https://unsplash.com/@barnimages": "forbidden (403)",
+        "https://unsplash.com/@brett_jordan": "forbidden (403)",
+        "https://unsplash.com/@fantin": "forbidden (403)",
+        "https://unsplash.com/@hocza": "forbidden (403)",
+        "https://unsplash.com/@imattsmart": "forbidden (403)",
+        "https://unsplash.com/@lanirudhreddy": "forbidden (403)",
+        "https://unsplash.com/@lazycreekimages": "forbidden (403)",
+        "https://unsplash.com/@yasin": "forbidden (403)",
+        "https://unsplash.com/@zanardi": "forbidden (403)",
+        "https://unsplash.com/photos/3esjG-nlgyk": "forbidden (403)",
+        "https://unsplash.com/photos/D3nouOYbALc": "forbidden (403)",
+        "https://unsplash.com/photos/GamuDTVm02g": "forbidden (403)",
+        "https://unsplash.com/photos/I8eTuMmxIfo": "forbidden (403)",
+        "https://unsplash.com/photos/W8BNwvOvW4M": "forbidden (403)",
+        "https://unsplash.com/photos/YU2mCvXR0wA": "forbidden (403)",
+        "https://unsplash.com/photos/dwlxTSpfKXg": "forbidden (403)",
+        "https://unsplash.com/photos/jaLaLQdkBOE": "forbidden (403)",
+        "https://unsplash.com/photos/pM9pkc9J918": "forbidden (403)",
+        "https://unsplash.com/photos/t5YUoHW6zRo": "forbidden (403)"
+      },
+      "mixed": false,
+      "urls_probed": 20,
+      "unreachable": 0
+    },
+    "https://with-bugs.practicesoftwaretesting.com": {
+      "ips": [
+        "104.21.9.144",
+        "172.67.160.144",
+        "2606:4700:3035::ac43:a090",
+        "2606:4700:3037::6815:990"
+      ],
+      "auth_method": "none",
+      "status_codes": [
+        200
+      ],
+      "notes": {},
+      "mixed": false,
+      "urls_probed": 2,
+      "unreachable": 0
+    }
+  },
+  "unresolved_hosts": [],
+  "auth": {
+    "http://www.w3.org/1998/Math/MathML": {
+      "probe": {
+        "status_code": 301,
+        "www_authenticate": null,
+        "detected_method": "unknown",
+        "note": "redirects to https://www.w3.org/1998/Math/MathML",
+        "error": null
+      }
+    },
+    "http://www.w3.org/1999/xhtml": {
+      "probe": {
+        "status_code": 301,
+        "www_authenticate": null,
+        "detected_method": "unknown",
+        "note": "redirects to https://www.w3.org/1999/xhtml",
+        "error": null
+      }
+    },
+    "http://www.w3.org/1999/xlink": {
+      "probe": {
+        "status_code": 301,
+        "www_authenticate": null,
+        "detected_method": "unknown",
+        "note": "redirects to https://www.w3.org/1999/xlink",
+        "error": null
+      }
+    },
+    "http://www.w3.org/2000/svg": {
+      "probe": {
+        "status_code": 301,
+        "www_authenticate": null,
+        "detected_method": "unknown",
+        "note": "redirects to https://www.w3.org/2000/svg",
+        "error": null
+      }
+    },
+    "http://www.w3.org/2000/xmlns/": {
+      "probe": {
+        "status_code": 301,
+        "www_authenticate": null,
+        "detected_method": "unknown",
+        "note": "redirects to https://www.w3.org/2000/xmlns/",
+        "error": null
+      }
+    },
+    "http://www.w3.org/XML/1998/namespace": {
+      "probe": {
+        "status_code": 301,
+        "www_authenticate": null,
+        "detected_method": "unknown",
+        "note": "redirects to https://www.w3.org/XML/1998/namespace",
+        "error": null
+      }
+    },
+    "https://angular.dev/best-practices/security#preventing-cross-site-scripting-xss": {
+      "probe": {
+        "status_code": 200,
+        "www_authenticate": null,
+        "detected_method": "none",
+        "note": null,
+        "error": null
+      }
+    },
+    "https://api.practicesoftwaretesting.com": {
+      "probe": {
+        "status_code": 404,
+        "www_authenticate": null,
+        "detected_method": "unknown",
+        "note": "not found (404)",
+        "error": null
+      }
+    },
+    "https://cloudflareinsights.com/cdn-cgi/rum": {
+      "probe": {
+        "status_code": 404,
+        "www_authenticate": null,
+        "detected_method": "unknown",
+        "note": "not found (404)",
+        "error": null
+      }
+    },
+    "https://getbootstrap.com/": {
+      "probe": {
+        "status_code": 200,
+        "www_authenticate": null,
+        "detected_method": "none",
+        "note": null,
+        "error": null
+      }
+    },
+    "https://github.com/testsmith-io/practice-software-testing": {
+      "probe": {
+        "status_code": 200,
+        "www_authenticate": null,
+        "detected_method": "none",
+        "note": null,
+        "error": null
+      }
+    },
+    "https://github.com/twbs/bootstrap/blob/main/LICENSE": {
+      "probe": {
+        "status_code": 200,
+        "www_authenticate": null,
+        "detected_method": "none",
+        "note": null,
+        "error": null
+      }
+    },
+    "https://github.com/twbs/bootstrap/graphs/contributors": {
+      "probe": {
+        "status_code": 200,
+        "www_authenticate": null,
+        "detected_method": "none",
+        "note": null,
+        "error": null
+      }
+    },
+    "https://github.com/uuidjs/uuid#getrandomvalues-not-supported": {
+      "probe": {
+        "status_code": 200,
+        "www_authenticate": null,
+        "detected_method": "none",
+        "note": null,
+        "error": null
+      }
+    },
+    "https://jwt.io": {
+      "probe": {
+        "status_code": 307,
+        "www_authenticate": null,
+        "detected_method": "unknown",
+        "note": "redirects off-origin to www.jwt.io",
+        "error": null
+      }
+    },
+    "https://popper.js.org/docs/v2/": {
+      "probe": {
+        "status_code": 200,
+        "www_authenticate": null,
+        "detected_method": "none",
+        "note": null,
+        "error": null
+      }
+    },
+    "https://testsmith-io.github.io/practice-software-testing/#/": {
+      "probe": {
+        "status_code": 200,
+        "www_authenticate": null,
+        "detected_method": "none",
+        "note": null,
+        "error": null
+      }
+    },
+    "https://unsplash.com/@andrewjoegeorge": {
+      "probe": {
+        "status_code": 403,
+        "www_authenticate": null,
+        "detected_method": "unknown",
+        "note": "forbidden (403)",
+        "error": null
+      }
+    },
+    "https://unsplash.com/@barnimages": {
+      "probe": {
+        "status_code": 403,
+        "www_authenticate": null,
+        "detected_method": "unknown",
+        "note": "forbidden (403)",
+        "error": null
+      }
+    },
+    "https://unsplash.com/@brett_jordan": {
+      "probe": {
+        "status_code": 403,
+        "www_authenticate": null,
+        "detected_method": "unknown",
+        "note": "forbidden (403)",
+        "error": null
+      }
+    },
+    "https://unsplash.com/@fantin": {
+      "probe": {
+        "status_code": 403,
+        "www_authenticate": null,
+        "detected_method": "unknown",
+        "note": "forbidden (403)",
+        "error": null
+      }
+    },
+    "https://unsplash.com/@hocza": {
+      "probe": {
+        "status_code": 403,
+        "www_authenticate": null,
+        "detected_method": "unknown",
+        "note": "forbidden (403)",
+        "error": null
+      }
+    },
+    "https://unsplash.com/@imattsmart": {
+      "probe": {
+        "status_code": 403,
+        "www_authenticate": null,
+        "detected_method": "unknown",
+        "note": "forbidden (403)",
+        "error": null
+      }
+    },
+    "https://unsplash.com/@lanirudhreddy": {
+      "probe": {
+        "status_code": 403,
+        "www_authenticate": null,
+        "detected_method": "unknown",
+        "note": "forbidden (403)",
+        "error": null
+      }
+    },
+    "https://unsplash.com/@lazycreekimages": {
+      "probe": {
+        "status_code": 403,
+        "www_authenticate": null,
+        "detected_method": "unknown",
+        "note": "forbidden (403)",
+        "error": null
+      }
+    },
+    "https://unsplash.com/@yasin": {
+      "probe": {
+        "status_code": 403,
+        "www_authenticate": null,
+        "detected_method": "unknown",
+        "note": "forbidden (403)",
+        "error": null
+      }
+    },
+    "https://unsplash.com/@zanardi": {
+      "probe": {
+        "status_code": 403,
+        "www_authenticate": null,
+        "detected_method": "unknown",
+        "note": "forbidden (403)",
+        "error": null
+      }
+    },
+    "https://unsplash.com/photos/3esjG-nlgyk": {
+      "probe": {
+        "status_code": 403,
+        "www_authenticate": null,
+        "detected_method": "unknown",
+        "note": "forbidden (403)",
+        "error": null
+      }
+    },
+    "https://unsplash.com/photos/D3nouOYbALc": {
+      "probe": {
+        "status_code": 403,
+        "www_authenticate": null,
+        "detected_method": "unknown",
+        "note": "forbidden (403)",
+        "error": null
+      }
+    },
+    "https://unsplash.com/photos/GamuDTVm02g": {
+      "probe": {
+        "status_code": 403,
+        "www_authenticate": null,
+        "detected_method": "unknown",
+        "note": "forbidden (403)",
+        "error": null
+      }
+    },
+    "https://unsplash.com/photos/I8eTuMmxIfo": {
+      "probe": {
+        "status_code": 403,
+        "www_authenticate": null,
+        "detected_method": "unknown",
+        "note": "forbidden (403)",
+        "error": null
+      }
+    },
+    "https://unsplash.com/photos/W8BNwvOvW4M": {
+      "probe": {
+        "status_code": 403,
+        "www_authenticate": null,
+        "detected_method": "unknown",
+        "note": "forbidden (403)",
+        "error": null
+      }
+    },
+    "https://unsplash.com/photos/YU2mCvXR0wA": {
+      "probe": {
+        "status_code": 403,
+        "www_authenticate": null,
+        "detected_method": "unknown",
+        "note": "forbidden (403)",
+        "error": null
+      }
+    },
+    "https://unsplash.com/photos/dwlxTSpfKXg": {
+      "probe": {
+        "status_code": 403,
+        "www_authenticate": null,
+        "detected_method": "unknown",
+        "note": "forbidden (403)",
+        "error": null
+      }
+    },
+    "https://unsplash.com/photos/jaLaLQdkBOE": {
+      "probe": {
+        "status_code": 403,
+        "www_authenticate": null,
+        "detected_method": "unknown",
+        "note": "forbidden (403)",
+        "error": null
+      }
+    },
+    "https://unsplash.com/photos/pM9pkc9J918": {
+      "probe": {
+        "status_code": 403,
+        "www_authenticate": null,
+        "detected_method": "unknown",
+        "note": "forbidden (403)",
+        "error": null
+      }
+    },
+    "https://unsplash.com/photos/t5YUoHW6zRo": {
+      "probe": {
+        "status_code": 403,
+        "www_authenticate": null,
+        "detected_method": "unknown",
+        "note": "forbidden (403)",
+        "error": null
+      }
+    },
+    "https://with-bugs.practicesoftwaretesting.com": {
+      "probe": {
+        "status_code": 200,
+        "www_authenticate": null,
+        "detected_method": "none",
+        "note": null,
+        "error": null
+      }
+    },
+    "https://with-bugs.practicesoftwaretesting.com/#/?bug-hunting=true": {
+      "probe": {
+        "status_code": 200,
+        "www_authenticate": null,
+        "detected_method": "none",
+        "note": null,
+        "error": null
+      }
+    }
+  }
+}
