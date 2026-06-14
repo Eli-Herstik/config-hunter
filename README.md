@@ -77,10 +77,13 @@ A time-budgeted pass of safe scrolls, hovers, and clicks runs on every page to s
 
 ## Output
 
-The console report lists each config source (network response, DOM script, JS chunk), the URLs extracted from it, the unique host set, and an "Authentication Analysis" section with a per-URL probe result and verdict (`basic`, `bearer`, `negotiate`, `oauth`, `none`, `unknown`, …). With `-o`, the same data is written as JSON, including:
+Results are emitted only as JSON, via `-o/--output`. Without it the crawl, DNS resolution, and auth-probe passes still run, but only progress lines are printed to the console (which source was captured, how many hosts resolved, how many roots were probed) — nothing is reported. The JSON report contains:
 
-- A `services` map keyed by origin (`scheme://host[:port]`, with the scheme's default port normalized away). A service — not a bare hostname — is the unit of roll-up: two ports on one box, or `http` vs `https`, are treated as distinct services with their own collapsed `auth_method`, `status_codes`, and `notes`, since on an internal estate they usually are. Each entry's `ips` are the resolved addresses for the service's hostname (DNS has no port), so services sharing a host share their IPs.
+- A `sources` array — each config source (network response, DOM script, JS chunk) with the clean URLs extracted from it and any parse `error`.
+- A `suspect_urls` array — URLs quarantined before probing as malformed or templated, each with its `reason` (`bad_host`, `template`) and the sources it came from.
+- A `services` map keyed by origin (`scheme://host[:port]`, with the scheme's default port normalized away). A service — not a bare hostname — is the unit of roll-up: two ports on one box, or `http` vs `https`, are treated as distinct services with their own collapsed `auth_method` (`basic`, `bearer`, `negotiate`, `oauth`, `none`, `unknown`, …), `status_codes`, and `notes`, since on an internal estate they usually are. Each entry's `ips` are the resolved addresses for the service's hostname (DNS has no port), so services sharing a host share their IPs.
 - An `unresolved_hosts` array — hosts referenced in configs that failed DNS resolution from the scanner's network position (each entry has `host` and an `error` reason such as `NXDOMAIN`, `SERVFAIL`, or `timeout`). URLs on unresolved hosts are skipped during the probe pass.
+- An `auth` map keyed by URL — the per-URL probe result (`status_code`, `www_authenticate`, `detected_method`, `note`, `error`). Host roots probed on the scanner's own initiative to disclose an undisclosed scheme are flagged `synthesized`.
 
 ## Tests
 
