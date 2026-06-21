@@ -7,6 +7,7 @@ and harvests all HTTP/HTTPS URLs found within them.
 
 import argparse
 import asyncio
+import base64
 import json
 import re
 import socket
@@ -1000,6 +1001,70 @@ def _headers_from_kv(items: list[str]) -> dict[str, str]:
     return headers
 
 
+def _bearer_from_headers(headers: dict[str, str]) -> str | None:
+    """Return the bare token from an 'Authorization: Bearer <token>' header, if present."""
+    for name, value in headers.items():
+        if name.lower() == "authorization" and value[:7].lower() == "bearer ":
+            return value[7:].strip()
+    return None
+
+
+def _decode_jwt_payload(token: str) -> dict | None:
+    """Decode a JWT's payload segment WITHOUT verifying its signature.
+    Returns the claims dict, or None if the token isn't a decodable JWT."""
+    parts = token.split(".")
+    if len(parts) < 2:
+        return None
+    payload = parts[1]
+    payload += "=" * (-len(payload) % 4)  # restore base64url padding
+    try:
+        raw = base64.urlsafe_b64decode(payload.encode("ascii"))
+        claims = json.loads(raw.decode("utf-8"))
+    except (ValueError, UnicodeDecodeError):
+        return None
+    return claims if isinstance(claims, dict) else None
+
+
+def _synth_oidc_session_storage(token: str, seed_url: str) -> dict[str, dict[str, str]]:
+    """Build an angular-oauth2-oidc sessionStorage keyset from a bearer JWT so the SPA
+    boots as authenticated without an interactive login. Returns {origin: {name: value}}.
+
+    On a storage reload (no auth code in the URL) the library only checks token
+    *presence + expiry* — signatures are validated at login time, not on reload — so a
+    real, unexpired access token plus its decoded claims satisfies the route guards.
+    """
+    p = urlparse(seed_url)
+    origin = f"{p.scheme}://{p.netloc}"
+    kv: dict[str, str] = {"access_token": token}
+    claims = _decode_jwt_payload(token)
+    if claims is None:
+        print("  [warn] --synth-oidc-session: bearer token is not a decodable JWT; "
+              "seeding access_token only (no expiry/claims).", file=sys.stderr)
+        return {origin: kv}
+    # exp/iat are seconds since epoch; angular-oauth2-oidc stores milliseconds as strings.
+    exp = claims.get("exp")
+    iat = claims.get("iat")
+    if isinstance(exp, (int, float)):
+        exp_ms = str(int(exp * 1000))
+        kv["expires_at"] = exp_ms
+        kv["id_token_expires_at"] = exp_ms
+    if isinstance(iat, (int, float)):
+        iat_ms = str(int(iat * 1000))
+        kv["access_token_stored_at"] = iat_ms
+        kv["id_token_stored_at"] = iat_ms
+    scope = claims.get("scope")
+    if isinstance(scope, str):
+        kv["granted_scopes"] = json.dumps(scope.split())
+    session_state = claims.get("session_state")
+    if isinstance(session_state, str):
+        kv["session_state"] = session_state
+    # getIdentityClaims() reads id_token_claims_obj; reuse the access token as a
+    # structurally valid id_token placeholder (only presence + expiry are checked here).
+    kv["id_token_claims_obj"] = json.dumps(claims)
+    kv["id_token"] = token
+    return {origin: kv}
+
+
 def _storage_state_to_probe_cookies(path: str, seed_url: str) -> dict[str, str]:
     """Read a Playwright storage-state JSON and extract cookies for the seed host
     as a flat {name: value} dict suitable for aiohttp.ClientSession(cookies=...)."""
@@ -1118,6 +1183,7 @@ async def crawl(
     storage_state: str | None = None,
     extra_http_headers: dict[str, str] | None = None,
     cookies: list[dict] | None = None,
+    session_storage: dict[str, dict[str, str]] | None = None,
 ) -> list[ConfigSource]:
     if isinstance(url, str):
         seeds = [url]
@@ -1151,6 +1217,16 @@ async def crawl(
         context = await browser.new_context(**context_kwargs)
         if cookies:
             await context.add_cookies(cookies)
+        if session_storage:
+            # Seed sessionStorage before any page script runs, origin-guarded so the
+            # token is never written on off-origin pages (e.g. the Keycloak domain).
+            init_js = (
+                "(() => { const data = " + json.dumps(session_storage) + ";"
+                " const kv = data[location.origin];"
+                " if (kv) { for (const k in kv) {"
+                " try { sessionStorage.setItem(k, kv[k]); } catch (e) {} } } })();"
+            )
+            await context.add_init_script(init_js)
 
         pages_visited = 0
         manifest_probed = False
@@ -1430,6 +1506,12 @@ def main() -> None:
         help='Send an extra HTTP header "Name: Value" (repeatable).',
     )
     parser.add_argument(
+        "--synth-oidc-session", action="store_true",
+        help='Synthesize an angular-oauth2-oidc sessionStorage session from the bearer '
+             'token in --header "Authorization: Bearer <jwt>", so the SPA boots '
+             'authenticated without an interactive login.',
+    )
+    parser.add_argument(
         "--follow-links", action="store_true",
         help="Auto-discover same-origin links from each crawled page",
     )
@@ -1462,6 +1544,15 @@ def main() -> None:
     cli_cookies = _cookies_from_kv(args.cookie, args.url)
     cli_headers = _headers_from_kv(args.header)
 
+    session_storage = None
+    if args.synth_oidc_session:
+        bearer = _bearer_from_headers(cli_headers)
+        if not bearer:
+            print('  [error] --synth-oidc-session requires '
+                  '--header "Authorization: Bearer <jwt>"', file=sys.stderr)
+            sys.exit(2)
+        session_storage = _synth_oidc_session_storage(bearer, args.url)
+
     sources = asyncio.run(crawl(
         url=seeds if len(seeds) > 1 else args.url,
         timeout=args.timeout,
@@ -1473,6 +1564,7 @@ def main() -> None:
         storage_state=args.storage_state,
         extra_http_headers=cli_headers or None,
         cookies=cli_cookies or None,
+        session_storage=session_storage,
     ))
 
     all_urls: list[str] = []
