@@ -1084,8 +1084,9 @@ def _decode_jwt_payload(token: str) -> dict | None:
 
 
 def _synth_oidc_session_storage(token: str, seed_url: str) -> dict[str, dict[str, str]]:
-    """Build an angular-oauth2-oidc sessionStorage keyset from a bearer JWT so the SPA
-    boots as authenticated without an interactive login. Returns {origin: {name: value}}.
+    """Build an angular-oauth2-oidc storage keyset from a bearer JWT so the SPA
+    boots as authenticated without an interactive login. Returns {origin: {name: value}};
+    crawl() writes it to both localStorage and sessionStorage since the app may use either.
 
     On a storage reload (no auth code in the URL) the library only checks token
     *presence + expiry* — signatures are validated at login time, not on reload — so a
@@ -1300,12 +1301,17 @@ async def crawl(
         if cookies:
             await context.add_cookies(cookies)
         if session_storage:
-            # Seed sessionStorage before any page script runs, origin-guarded so the
+            # Seed web storage before any page script runs, origin-guarded so the
             # token is never written on off-origin pages (e.g. the Keycloak domain).
+            # Write BOTH localStorage and sessionStorage: angular-oauth2-oidc (and
+            # most OIDC libs) can be configured with either as its OAuthStorage, and
+            # we can't know which from the outside. The unused store is dead weight
+            # the app ignores; the matching one boots it authenticated.
             init_js = (
                 "(() => { const data = " + json.dumps(session_storage) + ";"
                 " const kv = data[location.origin];"
                 " if (kv) { for (const k in kv) {"
+                " try { localStorage.setItem(k, kv[k]); } catch (e) {}"
                 " try { sessionStorage.setItem(k, kv[k]); } catch (e) {} } } })();"
             )
             await context.add_init_script(init_js)
@@ -1589,8 +1595,9 @@ def main() -> None:
     )
     parser.add_argument(
         "--synth-oidc-session", action="store_true",
-        help='Synthesize an angular-oauth2-oidc sessionStorage session from the bearer '
-             'token in --header "Authorization: Bearer <jwt>", so the SPA boots '
+        help='Synthesize an angular-oauth2-oidc web-storage session (written to both '
+             'localStorage and sessionStorage) from the bearer token in '
+             '--header "Authorization: Bearer <jwt>", so the SPA boots '
              'authenticated without an interactive login.',
     )
     parser.add_argument(
