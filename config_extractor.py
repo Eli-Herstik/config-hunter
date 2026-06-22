@@ -375,32 +375,45 @@ def _classify_dns_error(exc: BaseException) -> str:
     return str(exc)
 
 
+_RETRYABLE_DNS_ERRORS = {"timeout", "SERVFAIL"}
+
+
 async def _resolve_single(
     host: str,
     semaphore: asyncio.Semaphore,
     timeout: float,
+    attempts: int = 3,
+    backoff: float = 0.25,
 ) -> dict:
     """Resolve one host; return {host, ips} on success or {host, error} on failure.
     `ips` is the distinct resolved addresses (IPv4 + IPv6), sorted."""
     loop = asyncio.get_running_loop()
     async with semaphore:
-        try:
-            infos = await asyncio.wait_for(
-                loop.getaddrinfo(host, None),
-                timeout=timeout,
-            )
-            # getaddrinfo yields (family, type, proto, canonname, sockaddr);
-            # sockaddr[0] is the address string for both AF_INET and AF_INET6.
-            ips = sorted({info[4][0] for info in infos})
-            return {"host": host, "ips": ips}
-        except Exception as e:
-            return {"host": host, "error": _classify_dns_error(e)}
+        error = None
+        for attempt in range(attempts):
+            try:
+                infos = await asyncio.wait_for(
+                    loop.getaddrinfo(host, None),
+                    timeout=timeout,
+                )
+                # getaddrinfo yields (family, type, proto, canonname, sockaddr);
+                # sockaddr[0] is the address string for both AF_INET and AF_INET6.
+                ips = sorted({info[4][0] for info in infos})
+                return {"host": host, "ips": ips}
+            except Exception as e:
+                error = _classify_dns_error(e)
+                if error not in _RETRYABLE_DNS_ERRORS:
+                    break
+                if attempt + 1 < attempts:
+                    await asyncio.sleep(backoff * (attempt + 1))
+        return {"host": host, "error": error}
 
 
 async def resolve_hosts(
     hosts: list[str],
     timeout: float = 3.0,
     max_concurrent: int = 20,
+    attempts: int = 3,
 ) -> tuple[list[dict], dict[str, list[str]]]:
     """Resolve each host via the system resolver.
 
@@ -409,7 +422,7 @@ async def resolve_hosts(
     that resolved."""
     unique_hosts = list(dict.fromkeys(hosts))
     semaphore = asyncio.Semaphore(max_concurrent)
-    tasks = [_resolve_single(h, semaphore, timeout) for h in unique_hosts]
+    tasks = [_resolve_single(h, semaphore, timeout, attempts) for h in unique_hosts]
     results = await asyncio.gather(*tasks)
     failures = [r for r in results if "error" in r]
     failures.sort(key=lambda r: r["host"])
