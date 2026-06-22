@@ -956,6 +956,64 @@ async def _probe_manifests(
     return chunks_added
 
 
+# Sub-resource types worth re-fetching when the page fails to load them.
+# Scripts and data fetches (xhr/fetch) carry config and dependency URLs;
+# images/fonts/stylesheets don't, so they're not worth a server-side round-trip.
+_RECOVERABLE_RESOURCE_TYPES = {"script", "xhr", "fetch"}
+
+
+def _note_failed_request(request, failed: list[str]) -> None:
+    """Record a sub-resource the page couldn't load so it can be re-fetched
+    server-side. CORS-blocked and TLS-rejected requests fire 'requestfailed',
+    not 'response', so this is the only point at which their URLs are observable."""
+    try:
+        if request.resource_type in _RECOVERABLE_RESOURCE_TYPES:
+            failed.append(request.url)
+    except Exception:
+        pass
+
+
+async def _recover_failed_requests(
+    context,
+    failed_urls: list[str],
+    captured_js: list[tuple[str, str]],
+    captured_json: list[tuple[str, str]],
+    seen_urls: set[str],
+) -> int:
+    """Re-fetch requests the page failed to load via context.request, which runs
+    out-of-process and is not bound by the browser's same-origin policy (and
+    inherits ignore_https_errors). This recovers cross-origin modules the page
+    refused — typically a SystemJS / single-spa micro-frontend's entry bundle
+    blocked by CORS. Returns the number of bodies captured."""
+    recovered = 0
+    for url in failed_urls:
+        if url in seen_urls:
+            continue
+        try:
+            resp = await context.request.get(url, timeout=5000)
+            if resp.status < 200 or resp.status >= 300:
+                continue
+            body = await resp.text()
+        except Exception:
+            continue
+        if not body or len(body) > MAX_PAYLOAD_BYTES:
+            continue
+        # APIResponse exposes .headers/.url like Response, so the same
+        # content-type/extension classifiers apply.
+        is_json = _is_json_response(resp)
+        is_js = not is_json and _is_js_response(resp)
+        if not (is_json or is_js):
+            continue
+        if is_json:
+            captured_json.append((url, body))
+        else:
+            captured_js.append((url, body))
+        seen_urls.add(url)
+        recovered += 1
+        print(f"  [recover] {url}")
+    return recovered
+
+
 # ---------------------------------------------------------------------------
 # Authentication helpers
 # ---------------------------------------------------------------------------
@@ -1137,6 +1195,12 @@ async def _crawl_one_page(
     page.on("response", lambda resp: asyncio.ensure_future(
         capture_response(resp, captured, captured_js, seen_urls)
     ))
+    # CORS-blocked and TLS-rejected sub-resources never fire a 'response'
+    # event, so capture_response can't see them. Record their URLs here and
+    # re-fetch them server-side (below), where the same-origin policy doesn't
+    # apply — this is how we recover a micro-frontend's entry module.
+    failed_requests: list[str] = []
+    page.on("requestfailed", lambda req: _note_failed_request(req, failed_requests))
 
     print(f"Navigating to {url} ...")
     response = None
@@ -1167,6 +1231,12 @@ async def _crawl_one_page(
         discovered = await _discover_links(page, page.url)
     except Exception:
         pass
+
+    recovered = await _recover_failed_requests(
+        context, failed_requests, captured_js, captured, seen_urls
+    )
+    if recovered:
+        print(f"  [recover] captured {recovered} request(s) the page failed to load")
 
     await page.close()
     return dom_sources, discovered
@@ -1208,8 +1278,20 @@ async def crawl(
             queue.append(s)
 
     async with async_playwright() as pw:
-        browser = await pw.chromium.launch(headless=not headed)
-        context_kwargs: dict = {}
+        browser = await pw.chromium.launch(
+            headless=not headed,
+            args=[
+                # This is a scanner, not a user browser. Disabling the
+                # same-origin policy lets cross-origin micro-frontend modules
+                # (SystemJS / single-spa) actually load, so the app boots and
+                # exposes its real runtime dependencies instead of dying in
+                # LOADING_SOURCE_CODE on a CORS-blocked import. Pairs with
+                # ignore_https_errors so internal-CA backends load too.
+                "--disable-web-security",
+                "--disable-features=IsolateOrigins,site-per-process",
+            ],
+        )
+        context_kwargs: dict = {"ignore_https_errors": True}
         if storage_state:
             context_kwargs["storage_state"] = storage_state
         if extra_http_headers:
