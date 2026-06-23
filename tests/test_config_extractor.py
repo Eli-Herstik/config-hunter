@@ -43,7 +43,9 @@ from config_extractor import (
     _cookies_from_kv,
     _headers_from_kv,
     _storage_state_to_probe_cookies,
+    _storage_state_is_fresh,
     _check_auth_signal,
+    KeycloakAuth,
 )
 
 
@@ -1592,3 +1594,202 @@ async def test_probe_filtering_skips_unresolved_hosts(test_server):
     assert bad_url not in auth_map
     assert auth_map[good_url].probe_result is not None
     assert auth_map[good_url].probe_result.status_code == 200
+
+
+# ===========================================================================
+# Part 8: Keycloak auto-login
+# ===========================================================================
+
+
+class TestStorageStateIsFresh:
+    def test_missing_file_is_stale(self, tmp_path):
+        assert _storage_state_is_fresh(str(tmp_path / "nope.json")) is False
+
+    def test_empty_cookies_is_stale(self, tmp_path):
+        p = tmp_path / "s.json"
+        p.write_text(json.dumps({"cookies": [], "origins": []}))
+        assert _storage_state_is_fresh(str(p)) is False
+
+    def test_session_cookie_is_fresh(self, tmp_path):
+        # Playwright persists session cookies with expires == -1; usable.
+        p = tmp_path / "s.json"
+        p.write_text(json.dumps({"cookies": [{"name": "s", "value": "1", "expires": -1}]}))
+        assert _storage_state_is_fresh(str(p)) is True
+
+    def test_future_expiry_is_fresh(self, tmp_path):
+        p = tmp_path / "s.json"
+        p.write_text(json.dumps({"cookies": [
+            {"name": "s", "value": "1", "expires": 99999999999}]}))
+        assert _storage_state_is_fresh(str(p)) is True
+
+    def test_all_expired_is_stale(self, tmp_path):
+        p = tmp_path / "s.json"
+        p.write_text(json.dumps({"cookies": [{"name": "s", "value": "1", "expires": 1}]}))
+        assert _storage_state_is_fresh(str(p)) is False
+
+    def test_mixed_keeps_fresh_if_any_unexpired(self, tmp_path):
+        p = tmp_path / "s.json"
+        p.write_text(json.dumps({"cookies": [
+            {"name": "dead", "value": "1", "expires": 1},
+            {"name": "live", "value": "2", "expires": 99999999999},
+        ]}))
+        assert _storage_state_is_fresh(str(p)) is True
+
+
+# A fake single-IdP estate: the app bounces unauthenticated requests to a
+# Keycloak-style login form; submitting valid creds sets a session cookie and
+# returns the authenticated app (which carries a config URL to harvest).
+SSO_LOGIN_HTML = """\
+<html><body>
+<form id="kc-form-login" action="/realms/test/login-actions/authenticate" method="post">
+  <input id="username" name="username"/>
+  <input id="password" name="password" type="password"/>
+  <button id="kc-login" type="submit">Sign In</button>
+</form>
+</body></html>
+"""
+
+SSO_APP_HTML = """\
+<html><head>
+  <script type="application/json">
+    {"api_url": "https://sso-protected.example.com/api"}
+  </script>
+</head><body>authenticated app</body></html>
+"""
+
+
+def _create_sso_app():
+    app = web.Application()
+
+    async def handle_app(request):
+        # No IdP session yet -> redirect to the Keycloak authorize/login URL.
+        if request.cookies.get("APP_SESSION") == "ok":
+            return web.Response(text=SSO_APP_HTML, content_type="text/html")
+        raise web.HTTPFound("/realms/test/protocol/openid-connect/auth")
+
+    async def handle_login_page(request):
+        return web.Response(text=SSO_LOGIN_HTML, content_type="text/html")
+
+    async def handle_authenticate(request):
+        data = await request.post()
+        if data.get("username") == "alice" and data.get("password") == "s3cret":
+            # Keycloak sets its SSO cookie and bounces back to the app, which
+            # establishes its own session. Collapsed onto one origin for the test.
+            resp = web.HTTPFound("/")
+            resp.set_cookie("KEYCLOAK_IDENTITY", "tok", path="/")
+            resp.set_cookie("APP_SESSION", "ok", path="/")
+            raise resp
+        raise web.HTTPFound("/realms/test/protocol/openid-connect/auth")
+
+    app.router.add_get("/", handle_app)
+    app.router.add_get("/realms/test/protocol/openid-connect/auth", handle_login_page)
+    app.router.add_post("/realms/test/login-actions/authenticate", handle_authenticate)
+    return app
+
+
+def _start_sso_server():
+    loop = asyncio.new_event_loop()
+    app = _create_sso_app()
+    runner = web.AppRunner(app)
+    started = threading.Event()
+    port_holder = [0]
+
+    def run():
+        asyncio.set_event_loop(loop)
+        loop.run_until_complete(runner.setup())
+        site = web.TCPSite(runner, "127.0.0.1", 0)
+        loop.run_until_complete(site.start())
+        port_holder[0] = site._server.sockets[0].getsockname()[1]
+        started.set()
+        loop.run_forever()
+
+    t = threading.Thread(target=run, daemon=True)
+    t.start()
+    started.wait(timeout=10)
+    base_url = f"http://127.0.0.1:{port_holder[0]}"
+
+    def cleanup():
+        loop.call_soon_threadsafe(loop.stop)
+        t.join(timeout=5)
+
+    return base_url, cleanup
+
+
+@pytest.fixture(scope="module")
+def sso_server():
+    base_url, cleanup = _start_sso_server()
+    yield base_url
+    cleanup()
+
+
+@pytest.mark.asyncio
+async def test_auto_login_unlocks_app_and_caches_session(sso_server, tmp_path):
+    """With Keycloak creds, the crawler logs in on the bounce, harvests the
+    authenticated app's config, and writes the session to the cache file."""
+    state = tmp_path / "auth.json"
+    auth = KeycloakAuth(username="alice", password="s3cret", state_path=str(state))
+    sources = await crawl(sso_server, timeout=15000, wait_after_load=1500,
+                          keycloak=auth)
+    all_urls = {u for s in sources for u in s.urls_found}
+
+    assert "https://sso-protected.example.com/api" in all_urls
+    assert auth.succeeded is True
+    assert auth.attempted is True
+    # write-after-login: the session was cached, carrying the IdP cookie.
+    assert state.exists()
+    names = {c["name"] for c in json.loads(state.read_text())["cookies"]}
+    assert "KEYCLOAK_IDENTITY" in names
+
+
+@pytest.mark.asyncio
+async def test_without_credentials_stuck_at_idp(sso_server):
+    """No creds -> the crawl dead-ends on the login form and never sees the app."""
+    sources = await crawl(sso_server, timeout=15000, wait_after_load=1500)
+    all_urls = {u for s in sources for u in s.urls_found}
+    assert "https://sso-protected.example.com/api" not in all_urls
+
+
+@pytest.mark.asyncio
+async def test_bad_credentials_attempted_once_and_fails(sso_server):
+    """Rejected creds: login is attempted exactly once, marked failed, and the
+    protected config stays out of reach (no retry loop)."""
+    auth = KeycloakAuth(username="alice", password="wrong")
+    sources = await crawl(sso_server, timeout=15000, wait_after_load=1500,
+                          keycloak=auth)
+    all_urls = {u for s in sources for u in s.urls_found}
+    assert "https://sso-protected.example.com/api" not in all_urls
+    assert auth.attempted is True
+    assert auth.succeeded is False
+
+
+@pytest.mark.asyncio
+async def test_auto_login_skipped_when_no_form(test_server):
+    """On an app that never shows a Keycloak form, auto-login stays untriggered
+    and the normal crawl is unaffected."""
+    auth = KeycloakAuth(username="alice", password="s3cret")
+    sources = await crawl(test_server, timeout=10000, wait_after_load=1500,
+                          keycloak=auth)
+    all_urls = {u for s in sources for u in s.urls_found}
+    assert "https://strategy-a.example.com/api" in all_urls
+    assert auth.attempted is False
+    assert auth.succeeded is False
+
+
+@pytest.mark.asyncio
+async def test_fresh_cached_session_skips_login(sso_server, tmp_path):
+    """A previously cached, still-fresh session is loaded, so the app unlocks
+    without ever filling the login form (attempted stays False)."""
+    # First run logs in and writes the cache.
+    state = tmp_path / "auth.json"
+    seed_auth = KeycloakAuth(username="alice", password="s3cret",
+                             state_path=str(state))
+    await crawl(sso_server, timeout=15000, wait_after_load=1500, keycloak=seed_auth)
+    assert state.exists()
+
+    # Second run: load the cached session; no login form should appear.
+    reuse = KeycloakAuth(username="alice", password="s3cret", state_path=str(state))
+    sources = await crawl(sso_server, timeout=15000, wait_after_load=1500,
+                          storage_state=str(state), keycloak=reuse)
+    all_urls = {u for s in sources for u in s.urls_found}
+    assert "https://sso-protected.example.com/api" in all_urls
+    assert reuse.attempted is False

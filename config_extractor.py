@@ -8,11 +8,13 @@ and harvests all HTTP/HTTPS URLs found within them.
 import argparse
 import asyncio
 import json
+import os
 import re
 import socket
 import ssl
 import string
 import sys
+import time
 from dataclasses import dataclass, field
 from enum import StrEnum
 from urllib.parse import urljoin, urlparse
@@ -1021,6 +1023,25 @@ def _storage_state_to_probe_cookies(path: str, seed_url: str) -> dict[str, str]:
     return out
 
 
+def _storage_state_is_fresh(path: str) -> bool:
+    """True if `path` exists and holds at least one cookie that hasn't provably
+    expired — the load half of the session cache. Playwright persists session
+    cookies with expires == -1; those, and any with a future expiry, count as
+    usable. A file whose every cookie has a past expiry is treated as stale, so
+    the caller falls back to a fresh login instead of replaying a dead session."""
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+    except (OSError, json.JSONDecodeError):
+        return False
+    now = time.time()
+    for c in data.get("cookies", []):
+        exp = c.get("expires")
+        if exp is None or exp == -1 or exp > now:
+            return True
+    return False
+
+
 def _check_auth_signal(seed_url: str, final_url: str, status: int | None,
                       www_authenticate: str | None) -> str | None:
     """Return a warning string if the seed page looks unauthenticated, else None."""
@@ -1037,6 +1058,117 @@ def _check_auth_signal(seed_url: str, final_url: str, status: int | None,
     return None
 
 
+# ---------------------------------------------------------------------------
+# Keycloak auto-login
+# ---------------------------------------------------------------------------
+#
+# On a single-IdP estate, apps redirect unauthenticated requests to Keycloak.
+# Rather than require a hand-captured auth.json, the crawler can fill the IdP
+# login form the first time a navigation dead-ends on it, then ride the silent
+# SSO session for every other app in the same context. The login is attempted
+# at most once per crawl; on success the session is cached to disk so later runs
+# skip the form (and any MFA prompt) entirely.
+
+
+@dataclass
+class KeycloakAuth:
+    """Credentials and runtime state for in-crawl Keycloak login.
+
+    `host` (optional) restricts form-detection to the IdP origin. `state_path`
+    is the storage-state cache to (re)write after a successful login. `attempted`
+    bounds login to a single try per crawl so rejected credentials or an MFA
+    wall can't spin the loop."""
+    username: str
+    password: str
+    host: str | None = None
+    state_path: str | None = None
+    attempted: bool = False
+    succeeded: bool = False
+
+
+async def _is_keycloak_login_page(page: Page, host: str | None) -> bool:
+    """True if the page is showing the Keycloak login form. Detection keys on the
+    form fields (`#username` + `#password`), not the URL: the IdP's authorize URL
+    varies per realm/theme, but the field ids are stable across Keycloak versions.
+    When `host` is set, the page must also be on that origin."""
+    if host:
+        page_host = (urlparse(page.url).hostname or "").lower()
+        if page_host != host.lower():
+            return False
+    try:
+        has_password = await page.locator("#password").count() > 0
+        has_username = await page.locator("#username").count() > 0
+    except Exception:
+        return False
+    return has_password and has_username
+
+
+async def _submit_keycloak_form(page: Page, timeout: int) -> None:
+    """Submit the Keycloak login form and wait for the resulting navigation."""
+    try:
+        await page.click("#kc-login")
+    except Exception:
+        # Custom themes may lack the #kc-login id; Enter submits the form too.
+        try:
+            await page.keyboard.press("Enter")
+        except Exception:
+            pass
+    try:
+        await page.wait_for_load_state("networkidle", timeout=timeout)
+    except Exception:
+        pass
+
+
+async def _perform_keycloak_login(
+    page: Page, auth: KeycloakAuth, target_url: str, timeout: int
+) -> bool:
+    """Fill and submit the Keycloak login form, then reload `target_url` so the
+    page lands on the authenticated app. Returns True only if we're no longer on
+    a login form afterward (i.e. credentials accepted and no MFA wall)."""
+    print("  [auth] Keycloak login form detected; submitting credentials...",
+          file=sys.stderr)
+    try:
+        if await page.locator("#username").count() > 0:
+            await page.fill("#username", auth.username)
+        if await page.locator("#password").count() > 0:
+            await page.fill("#password", auth.password)
+        await _submit_keycloak_form(page, timeout)
+        # Identity-first themes split username and password onto two pages.
+        if (await _is_keycloak_login_page(page, auth.host)
+                and await page.locator("#password").count() > 0):
+            await page.fill("#password", auth.password)
+            await _submit_keycloak_form(page, timeout)
+    except Exception as e:
+        print(f"  [auth] Keycloak login failed: {e}", file=sys.stderr)
+        return False
+
+    # Reload the target so captures reflect the authenticated app, not the
+    # login page or the post-login landing route.
+    try:
+        await page.goto(target_url, wait_until="networkidle", timeout=timeout)
+    except Exception as e:
+        print(f"  [warn] Post-login navigation to {target_url} failed: {e}",
+              file=sys.stderr)
+
+    if await _is_keycloak_login_page(page, auth.host):
+        print("  [auth] Still on the Keycloak login form after submit — "
+              "credentials rejected or MFA required; giving up on auto-login.",
+              file=sys.stderr)
+        return False
+    return True
+
+
+async def _save_storage_state(context, path: str) -> None:
+    """Persist the context's session to `path` (the write half of the
+    load-if-fresh / write-after-login cache)."""
+    try:
+        await context.storage_state(path=path)
+        print(f"  [auth] Saved authenticated session to {path}", file=sys.stderr)
+    except Exception as e:
+        print(f"  [warn] Could not save session state to {path}: {e}",
+              file=sys.stderr)
+
+
 async def _crawl_one_page(
     context,
     url: str,
@@ -1048,6 +1180,7 @@ async def _crawl_one_page(
     wait_after_load: int,
     interact_budget_ms: int,
     is_seed: bool = False,
+    keycloak: KeycloakAuth | None = None,
 ) -> tuple[list[ConfigSource], list[str]]:
     """Visit one URL; return (dom_sources, discovered_links)."""
     page = await context.new_page()
@@ -1062,13 +1195,31 @@ async def _crawl_one_page(
     except Exception as e:
         print(f"  [warn] Navigation issue for {url}: {e}", file=sys.stderr)
 
-    if is_seed:
+    # Auto-login: if this navigation dead-ended on the Keycloak IdP login form,
+    # authenticate and reload the target before anything is captured, so the
+    # captures reflect the authenticated app rather than the login screen. Tried
+    # at most once per crawl; a later app whose own session lapses can still
+    # trigger it, but a rejected attempt is never retried.
+    logged_in_now = False
+    if keycloak and not keycloak.succeeded and not keycloak.attempted:
+        if await _is_keycloak_login_page(page, keycloak.host):
+            keycloak.attempted = True
+            keycloak.succeeded = await _perform_keycloak_login(
+                page, keycloak, url, timeout)
+            logged_in_now = keycloak.succeeded
+            if keycloak.succeeded and keycloak.state_path:
+                await _save_storage_state(context, keycloak.state_path)
+
+    if is_seed and not logged_in_now:
         status = response.status if response else None
         www_auth = response.headers.get("www-authenticate") if response else None
         signal = _check_auth_signal(url, page.url, status, www_auth)
         if signal:
-            print(f"  [auth] {signal} Pass a session via --storage-state.",
-                  file=sys.stderr)
+            hint = ("could not auto-login (no Keycloak form on this page)."
+                    if keycloak is not None else
+                    "Pass --keycloak-user/--keycloak-password to log in "
+                    "automatically, or a session via --storage-state.")
+            print(f"  [auth] {signal} {hint}", file=sys.stderr)
 
     if wait_after_load > 0:
         await page.wait_for_timeout(wait_after_load)
@@ -1101,6 +1252,7 @@ async def crawl(
     storage_state: str | None = None,
     extra_http_headers: dict[str, str] | None = None,
     cookies: list[dict] | None = None,
+    keycloak: KeycloakAuth | None = None,
 ) -> list[ConfigSource]:
     if isinstance(url, str):
         seeds = [url]
@@ -1127,8 +1279,11 @@ async def crawl(
     async with async_playwright() as pw:
         browser = await pw.chromium.launch(headless=not headed)
         context_kwargs: dict = {}
-        if storage_state:
+        if storage_state and _storage_state_is_fresh(storage_state):
             context_kwargs["storage_state"] = storage_state
+        elif storage_state:
+            print(f"  [auth] Cached session {storage_state} is missing or "
+                  "expired; starting without it.", file=sys.stderr)
         if extra_http_headers:
             context_kwargs["extra_http_headers"] = extra_http_headers
         context = await browser.new_context(**context_kwargs)
@@ -1151,6 +1306,7 @@ async def crawl(
                 wait_after_load=wait_after_load,
                 interact_budget_ms=interact_budget_ms,
                 is_seed=(pages_visited == 0),
+                keycloak=keycloak,
             )
             all_dom_sources.extend(dom_sources)
             pages_visited += 1
@@ -1394,7 +1550,21 @@ def main() -> None:
     )
     parser.add_argument(
         "--storage-state", type=str, default=None,
-        help="Load a Playwright storage-state JSON before crawling",
+        help="Playwright storage-state JSON: loaded before crawling if fresh, "
+             "and rewritten after a successful --keycloak auto-login (a cache).",
+    )
+    parser.add_argument(
+        "--keycloak-user", type=str, default=None,
+        help="Username for automatic Keycloak login when a page redirects to "
+             "the IdP login form. Enables in-crawl auto-login.",
+    )
+    parser.add_argument(
+        "--keycloak-password", type=str, default=None,
+        help="Password for Keycloak login (or set the KEYCLOAK_PASSWORD env var).",
+    )
+    parser.add_argument(
+        "--keycloak-host", type=str, default=None,
+        help="Keycloak IdP hostname; restricts auto-login to forms on this host.",
     )
     parser.add_argument(
         "--cookie", action="append", default=[],
@@ -1433,6 +1603,20 @@ def main() -> None:
     cli_cookies = _cookies_from_kv(args.cookie, args.url)
     cli_headers = _headers_from_kv(args.header)
 
+    keycloak = None
+    if args.keycloak_user:
+        password = args.keycloak_password or os.environ.get("KEYCLOAK_PASSWORD")
+        if not password:
+            print("  [error] --keycloak-user requires --keycloak-password or the "
+                  "KEYCLOAK_PASSWORD environment variable.", file=sys.stderr)
+            sys.exit(2)
+        keycloak = KeycloakAuth(
+            username=args.keycloak_user,
+            password=password,
+            host=args.keycloak_host,
+            state_path=args.storage_state,  # reuse --storage-state as the cache
+        )
+
     sources = asyncio.run(crawl(
         url=seeds if len(seeds) > 1 else args.url,
         timeout=args.timeout,
@@ -1444,6 +1628,7 @@ def main() -> None:
         storage_state=args.storage_state,
         extra_http_headers=cli_headers or None,
         cookies=cli_cookies or None,
+        keycloak=keycloak,
     ))
 
     all_urls: list[str] = []

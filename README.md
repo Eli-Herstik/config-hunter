@@ -48,6 +48,41 @@ python config_extractor.py https://app.example.com \
     --header "Authorization: Bearer eyJ…"
 ```
 
+#### Automatic Keycloak login
+
+On an estate behind a single Keycloak IdP, the crawler can log in itself instead
+of being handed a session. Give it credentials and, the first time a navigation
+dead-ends on the Keycloak login form, it fills the form, returns to the target,
+and rides the silent SSO session into every other app in the same run:
+
+```sh
+python config_extractor.py https://app.example.com \
+    --keycloak-user alice \
+    --keycloak-password s3cret        # or: export KEYCLOAK_PASSWORD=…
+```
+
+Pair it with `--storage-state` to use that file as a **session cache**: it's
+loaded before crawling when still fresh, and rewritten after a successful login.
+So the first run does the login (do it `--headed` once if MFA is enabled), and
+later runs reuse the cached session and skip the form entirely:
+
+```sh
+python config_extractor.py https://app.example.com \
+    --keycloak-user alice --storage-state auth.json
+```
+
+Notes and limits:
+
+- Detection keys on the Keycloak login form's stable field ids (`#username`,
+  `#password`, `#kc-login`), not a URL pattern — so it survives custom realm
+  URLs and themes. Scope it to the IdP origin with `--keycloak-host`.
+- Login is attempted **at most once** per crawl; rejected credentials or an MFA
+  wall fail fast rather than looping. MFA/OTP can't be scripted — log in once
+  `--headed` to populate the cache, then reuse it.
+- Without `--storage-state`, login still works; the session just lives in the
+  run and isn't cached. With it, the auth-probe pass also reuses the cached
+  session automatically.
+
 ### Crawling more pages
 
 ```sh
