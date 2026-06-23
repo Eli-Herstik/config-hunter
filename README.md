@@ -34,10 +34,9 @@ python config_extractor.py https://app.example.com -o results.json
 
 ### Authenticated targets
 
-Capture a session interactively with Playwright, then re-use it:
+Provide a session:
 
 ```sh
-playwright codegen --save-storage=auth.json https://app.example.com
 python config_extractor.py https://app.example.com --storage-state auth.json
 ```
 
@@ -70,7 +69,7 @@ A time-budgeted pass of safe scrolls, hovers, and clicks runs on every page to s
 | `--max-pages N` | Cap pages visited (default 1) |
 | `--interact-budget MS` | Per-page interaction budget (default 8000) |
 | `--probe-timeout S` / `--probe-concurrency N` | Tune the auth-probe pass |
-| `--storage-state PATH` | Reuse a saved Playwright session (`playwright codegen --save-storage=…`) |
+| `--storage-state PATH` | Reuse a saved Playwright session |
 | `--cookie KEY=VAL` | Set a cookie (repeatable) |
 | `--header "Name: Value"` | Set an extra header (repeatable) |
 

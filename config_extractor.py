@@ -1067,8 +1067,7 @@ async def _crawl_one_page(
         www_auth = response.headers.get("www-authenticate") if response else None
         signal = _check_auth_signal(url, page.url, status, www_auth)
         if signal:
-            print(f"  [auth] {signal} Pass a session via --storage-state "
-                  "(mint one with `playwright codegen --save-storage=auth.json <url>`).",
+            print(f"  [auth] {signal} Pass a session via --storage-state.",
                   file=sys.stderr)
 
     if wait_after_load > 0:
@@ -1395,8 +1394,7 @@ def main() -> None:
     )
     parser.add_argument(
         "--storage-state", type=str, default=None,
-        help="Load a Playwright storage-state JSON before crawling "
-             "(mint one with `playwright codegen --save-storage=auth.json <url>`)",
+        help="Load a Playwright storage-state JSON before crawling",
     )
     parser.add_argument(
         "--cookie", action="append", default=[],
