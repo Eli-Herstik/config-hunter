@@ -1021,24 +1021,6 @@ def _storage_state_to_probe_cookies(path: str, seed_url: str) -> dict[str, str]:
     return out
 
 
-async def _run_login_capture(url: str, save_path: str) -> None:
-    """Open a headed browser, wait for the user to log in, save storage state, exit."""
-    async with async_playwright() as pw:
-        browser = await pw.chromium.launch(headless=False)
-        context = await browser.new_context()
-        page = await context.new_page()
-        try:
-            await page.goto(url)
-        except Exception as e:
-            print(f"  [warn] Initial navigation issue: {e}", file=sys.stderr)
-        print(f"\n  Log in in the browser window, then press Enter here to save the session to {save_path} ...")
-        loop = asyncio.get_running_loop()
-        await loop.run_in_executor(None, input)
-        await context.storage_state(path=save_path)
-        await browser.close()
-        print(f"Saved storage state to {save_path}.")
-
-
 def _check_auth_signal(seed_url: str, final_url: str, status: int | None,
                       www_authenticate: str | None) -> str | None:
     """Return a warning string if the seed page looks unauthenticated, else None."""
@@ -1085,7 +1067,9 @@ async def _crawl_one_page(
         www_auth = response.headers.get("www-authenticate") if response else None
         signal = _check_auth_signal(url, page.url, status, www_auth)
         if signal:
-            print(f"  [auth] {signal} Try --login or refresh --storage-state.", file=sys.stderr)
+            print(f"  [auth] {signal} Pass a session via --storage-state "
+                  "(mint one with `playwright codegen --save-storage=auth.json <url>`).",
+                  file=sys.stderr)
 
     if wait_after_load > 0:
         await page.wait_for_timeout(wait_after_load)
@@ -1410,16 +1394,9 @@ def main() -> None:
         help="Path to a file with extra seed URLs (one per line)",
     )
     parser.add_argument(
-        "--login", action="store_true",
-        help="Open a headed browser, wait for manual login, save the session, and exit",
-    )
-    parser.add_argument(
-        "--save-storage", type=str, default="auth.json",
-        help="Output path for --login mode (default: auth.json)",
-    )
-    parser.add_argument(
         "--storage-state", type=str, default=None,
-        help="Load a Playwright storage-state JSON before crawling",
+        help="Load a Playwright storage-state JSON before crawling "
+             "(mint one with `playwright codegen --save-storage=auth.json <url>`)",
     )
     parser.add_argument(
         "--cookie", action="append", default=[],
@@ -1442,10 +1419,6 @@ def main() -> None:
         help="Per-page interaction budget in ms (default: 8000)",
     )
     args = parser.parse_args()
-
-    if args.login:
-        asyncio.run(_run_login_capture(args.url, args.save_storage))
-        return
 
     seeds: list[str] = [args.url]
     if args.routes:
