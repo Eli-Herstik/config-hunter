@@ -1074,26 +1074,32 @@ def _check_auth_signal(seed_url: str, final_url: str, status: int | None,
 class KeycloakAuth:
     """Credentials and runtime state for in-crawl Keycloak login.
 
-    `host` (optional) restricts form-detection to the IdP origin. `state_path`
-    is the storage-state cache to (re)write after a successful login. `attempted`
-    bounds login to a single try per crawl so rejected credentials or an MFA
-    wall can't spin the loop."""
+    `hosts` (optional) is an allowlist of IdP origins that form-detection is
+    restricted to; empty means any origin is accepted. It's normalized to
+    lowercase in __post_init__ so membership tests compare against a lowercased
+    page host. `state_path` is the storage-state cache to (re)write after a
+    successful login. `attempted` bounds login to a single try per crawl so
+    rejected credentials or an MFA wall can't spin the loop."""
     username: str
     password: str
-    host: str | None = None
+    hosts: tuple[str, ...] = ()
     state_path: str | None = None
     attempted: bool = False
     succeeded: bool = False
 
+    def __post_init__(self) -> None:
+        self.hosts = tuple(h.lower() for h in self.hosts)
 
-async def _is_keycloak_login_page(page: Page, host: str | None) -> bool:
+
+async def _is_keycloak_login_page(page: Page, hosts: tuple[str, ...] = ()) -> bool:
     """True if the page is showing the Keycloak login form. Detection keys on the
     form fields (`#username` + `#password`), not the URL: the IdP's authorize URL
     varies per realm/theme, but the field ids are stable across Keycloak versions.
-    When `host` is set, the page must also be on that origin."""
-    if host:
+    When `hosts` is non-empty, the page must also be on one of those origins — an
+    allowlist of known-good IdP hostnames, pre-lowercased by KeycloakAuth."""
+    if hosts:
         page_host = (urlparse(page.url).hostname or "").lower()
-        if page_host != host.lower():
+        if page_host not in hosts:
             return False
     try:
         has_password = await page.locator("#password").count() > 0
@@ -1134,7 +1140,7 @@ async def _perform_keycloak_login(
             await page.fill("#password", auth.password)
         await _submit_keycloak_form(page, timeout)
         # Identity-first themes split username and password onto two pages.
-        if (await _is_keycloak_login_page(page, auth.host)
+        if (await _is_keycloak_login_page(page, auth.hosts)
                 and await page.locator("#password").count() > 0):
             await page.fill("#password", auth.password)
             await _submit_keycloak_form(page, timeout)
@@ -1150,7 +1156,7 @@ async def _perform_keycloak_login(
         print(f"  [warn] Post-login navigation to {target_url} failed: {e}",
               file=sys.stderr)
 
-    if await _is_keycloak_login_page(page, auth.host):
+    if await _is_keycloak_login_page(page, auth.hosts):
         print("  [auth] Still on the Keycloak login form after submit — "
               "credentials rejected or MFA required; giving up on auto-login.",
               file=sys.stderr)
@@ -1202,7 +1208,7 @@ async def _crawl_one_page(
     # trigger it, but a rejected attempt is never retried.
     logged_in_now = False
     if keycloak and not keycloak.succeeded and not keycloak.attempted:
-        if await _is_keycloak_login_page(page, keycloak.host):
+        if await _is_keycloak_login_page(page, keycloak.hosts):
             keycloak.attempted = True
             keycloak.succeeded = await _perform_keycloak_login(
                 page, keycloak, url, timeout)
@@ -1563,8 +1569,9 @@ def main() -> None:
         help="Password for Keycloak login (or set the KEYCLOAK_PASSWORD env var).",
     )
     parser.add_argument(
-        "--keycloak-host", type=str, default=None,
-        help="Keycloak IdP hostname; restricts auto-login to forms on this host.",
+        "--keycloak-host", action="append", default=[], metavar="HOST",
+        help="Keycloak IdP hostname; restricts auto-login to forms on this host. "
+             "Repeatable to allow more than one valid IdP hostname.",
     )
     parser.add_argument(
         "--cookie", action="append", default=[],
@@ -1613,7 +1620,7 @@ def main() -> None:
         keycloak = KeycloakAuth(
             username=args.keycloak_user,
             password=password,
-            host=args.keycloak_host,
+            hosts=tuple(args.keycloak_host),
             state_path=args.storage_state,  # reuse --storage-state as the cache
         )
 

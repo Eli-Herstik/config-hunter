@@ -75,7 +75,8 @@ Notes and limits:
 
 - Detection keys on the Keycloak login form's stable field ids (`#username`,
   `#password`, `#kc-login`), not a URL pattern — so it survives custom realm
-  URLs and themes. Scope it to the IdP origin with `--keycloak-host`.
+  URLs and themes. Scope it to the IdP origin with `--keycloak-host` (repeatable
+  when the estate has more than one valid Keycloak hostname).
 - Login is attempted **at most once** per crawl; rejected credentials or an MFA
   wall fail fast rather than looping. MFA/OTP can't be scripted — log in once
   `--headed` to populate the cache, then reuse it.
