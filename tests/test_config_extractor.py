@@ -19,6 +19,8 @@ from config_extractor import (
     _partition_urls,
     extract_urls,
     extract_urls_from_text,
+    strip_js_block_comments,
+    process_js_captures,
     sanitize_js_object,
     try_parse_json,
     _is_json_response,
@@ -210,6 +212,65 @@ class TestExtractUrlsFromText:
         text = "https://example.com/api?key=val&foo=bar"
         result = extract_urls_from_text(text)
         assert result == ["https://example.com/api?key=val&foo=bar"]
+
+
+class TestStripJsBlockComments:
+    def test_url_in_block_comment_removed(self):
+        # The license-banner case that motivated this.
+        text = '/*! bundled by webpack, https://reactjs.org */ var x = 1;'
+        assert "https://reactjs.org" not in strip_js_block_comments(text)
+
+    def test_multiline_license_banner_removed(self):
+        text = (
+            '/*!\n'
+            '  * Bootstrap v5.3.7 (https://getbootstrap.com/)\n'
+            '  * https://github.com/twbs/bootstrap/blob/main/LICENSE\n'
+            '  */\n'
+            'var api = "https://api.internal.corp/v1";'
+        )
+        out = strip_js_block_comments(text)
+        assert "https://getbootstrap.com/" not in out
+        assert "https://github.com/twbs/bootstrap/blob/main/LICENSE" not in out
+        assert "https://api.internal.corp/v1" in out
+
+    def test_url_in_string_kept(self):
+        # The `//` in a real URL must never be read as a comment.
+        text = 'var api = "https://api.internal.corp/v1";'
+        assert "https://api.internal.corp/v1" in strip_js_block_comments(text)
+
+    def test_double_slash_in_string_not_a_comment(self):
+        text = "const u = 'http://a.corp/x'; const v = 'http://b.corp/y';"
+        out = strip_js_block_comments(text)
+        assert "http://a.corp/x" in out
+        assert "http://b.corp/y" in out
+
+    def test_block_comment_markers_in_string_kept(self):
+        # `/*` and `*/` inside a string literal must not trigger comment stripping.
+        text = 'var u = "https://real.corp/a/*b*/c";'
+        assert "https://real.corp/a/*b*/c" in strip_js_block_comments(text)
+
+    def test_url_next_to_slash_stripping_regex_survives(self):
+        # A URL-normalizing regex with an escaped `//` sits in code; the real URL
+        # that follows on the same (minified) line must survive. Block-only
+        # stripping never touches `//`, so there's nothing to misfire.
+        text = r'x.replace(/https?:\/\//g, "");var u="https://real.corp/api";'
+        out = strip_js_block_comments(text)
+        assert "https://real.corp/api" in out
+
+    def test_line_comment_url_deliberately_kept(self):
+        # `//` line comments are intentionally NOT stripped (see docstring);
+        # stripping them safely needs regex disambiguation we don't attempt.
+        text = 'var x = 1; // see https://docs.internal.corp/guide\n'
+        assert "https://docs.internal.corp/guide" in strip_js_block_comments(text)
+
+    def test_process_js_captures_ignores_banner_urls(self):
+        body = (
+            '/*! @license MIT https://cdn.jsdelivr.net/lib */\n'
+            'var API = "https://api.internal.corp/v1";'
+        )
+        sources = process_js_captures([("https://app/bundle.js", body)])
+        assert len(sources) == 1
+        assert sources[0].urls_found == ["https://api.internal.corp/v1"]
 
 
 class TestSanitizeJsObject:

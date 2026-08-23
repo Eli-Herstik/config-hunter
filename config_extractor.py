@@ -489,6 +489,66 @@ def extract_urls_from_text(text: str) -> list[str]:
     return urls
 
 
+def strip_js_block_comments(text: str) -> str:
+    """Drop `/* */` block comments from JavaScript source, leaving string-literal
+    contents untouched.
+
+    Used before regex URL extraction on JS bodies so URLs that live only in
+    license banners (`/*! Bootstrap v5.3.7 (https://getbootstrap.com/) ... */`,
+    `@license` headers) don't surface as service dependencies. A URL that also
+    appears in real code is still captured, because extraction dedupes; only
+    comment-only URLs disappear.
+
+    Block comments *only*, on purpose. This is a small lexical scanner, not a JS
+    parser, and its cardinal duty is never to drop a real URL. Block comments are
+    the one comment form that can be stripped with that guarantee: in code
+    position `/*` unambiguously opens a comment (a regex can't begin with `*`,
+    and it's never division), and `*/` unambiguously closes it — so scanning one
+    can't desync the string tracking, and a real URL inside a string is never at
+    risk. `//` line comments are deliberately NOT stripped: telling a `//`
+    comment apart from the `//` inside a regex literal like `/https?:\\/\\//`
+    needs full regex/division disambiguation, which is unreliable on minified
+    bundles and — when wrong — corrupts string tracking and swallows real URLs
+    (observed in practice). License banners, the noise this targets, are block
+    comments regardless; the residual `// ...` URL is rare in built assets and
+    left in as harmless noise, the safe direction.
+
+    String literals ('...', "...", `...`) are tracked (with escapes) so the `/*`
+    or `//` inside a real `"https://host"` is never mistaken for a comment.
+    """
+    out: list[str] = []
+    i, n = 0, len(text)
+    quote: str | None = None       # active string delimiter, else None
+
+    while i < n:
+        c = text[i]
+        nxt = text[i + 1] if i + 1 < n else ""
+
+        if quote is not None:                      # inside a string literal
+            out.append(c)
+            if c == "\\" and i + 1 < n:            # keep the escaped char verbatim
+                out.append(nxt)
+                i += 2
+                continue
+            if c == quote:
+                quote = None
+            i += 1
+        elif c == "/" and nxt == "*":              # block comment -> drop to */
+            i += 2
+            while i + 1 < n and not (text[i] == "*" and text[i + 1] == "/"):
+                i += 1
+            i += 2
+        elif c in "'\"`":                          # string literal opens
+            quote = c
+            out.append(c)
+            i += 1
+        else:                                      # ordinary code character
+            out.append(c)
+            i += 1
+
+    return "".join(out)
+
+
 # ---------------------------------------------------------------------------
 # JSON sanitization (JS object -> JSON best-effort)
 # ---------------------------------------------------------------------------
@@ -594,10 +654,13 @@ def process_network_captures(captured: list[tuple[str, str]]) -> list[ConfigSour
 
 
 def process_js_captures(captured: list[tuple[str, str]]) -> list[ConfigSource]:
-    """Extract URLs from captured JS bodies via regex (no JSON parsing)."""
+    """Extract URLs from captured JS bodies via regex (no JSON parsing).
+
+    Block comments are stripped first (see strip_js_block_comments), so URLs that
+    live only in license banners don't get reported as service dependencies."""
     sources: list[ConfigSource] = []
     for url, body in captured:
-        urls = extract_urls_from_text(body)
+        urls = extract_urls_from_text(strip_js_block_comments(body))
         if urls:
             sources.append(ConfigSource(
                 origin=f"js: {url}",
