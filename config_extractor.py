@@ -1345,7 +1345,7 @@ def write_results(
     # component: `ips` is the distinct resolved addresses (IPv4 + IPv6, sorted)
     # for that host — it can map to several (round-robin DNS, load balancers,
     # dual-stack), and shared IPs across services reveal a common backend.
-    # `auth_method` is the highest-precedence AuthMethod seen across the
+    # `auth_verdict` is the highest-precedence AuthMethod seen across the
     # service's probed URLs (see _VERDICT_PRECEDENCE); `status_codes` lists the
     # distinct HTTP statuses observed — the evidence behind the verdict, and what
     # disambiguates an `unknown` service (403 vs 404 vs 503); `notes` maps each
@@ -1376,7 +1376,7 @@ def write_results(
         hostname = urlparse(svc).hostname
         services_section[svc] = {
             "ips": (ip_map or {}).get(hostname, []),
-            "auth_method": _collapse_host_verdict(auth_verdicts),
+            "auth_verdict": _collapse_host_verdict(auth_verdicts),
             "status_codes": sorted({p.status_code for _, p in probes
                                     if p and p.status_code is not None}),
             "notes": {url: p.note for url, p in sorted(probes) if p and p.note},

@@ -679,7 +679,7 @@ def test_write_results_services_map_collapses_and_filters(tmp_path):
 
     svc = services["https://svc.example.com"]
     assert svc["ips"] == ["10.0.0.5"]  # joined through the hostname
-    assert svc["auth_method"] == "bearer"  # concrete scheme outranks none
+    assert svc["auth_verdict"] == "bearer"  # concrete scheme outranks none
     assert svc["status_codes"] == [200, 401]  # distinct, sorted
     # notes: keyed by the URL that carried one; the note-less `/` is absent
     assert svc["notes"] == {"https://svc.example.com/api": "challenged at /api"}
@@ -689,7 +689,7 @@ def test_write_results_services_map_collapses_and_filters(tmp_path):
 
     down = services["https://down.example.com"]
     assert down["ips"] == ["10.0.0.6", "10.0.0.7"]  # multiple IPs preserved
-    assert down["auth_method"] is None     # only a transport error, no verdict
+    assert down["auth_verdict"] is None    # only a transport error, no verdict
     assert down["status_codes"] == []      # transport error carries no status
     assert down["notes"] == {}             # transport error sets `error`, not a note
     assert down["mixed"] is False
@@ -751,11 +751,11 @@ def test_write_results_keys_services_by_origin(tmp_path):
     # The :443 URL collapsed into the bare https origin, not its own row.
     https_default = services["https://svc.example.com"]
     assert https_default["urls_probed"] == 2
-    assert https_default["auth_method"] == "negotiate"
+    assert https_default["auth_verdict"] == "negotiate"
     assert https_default["mixed"] is False
     # Distinct port and distinct scheme keep their own verdicts.
-    assert services["https://svc.example.com:8080"]["auth_method"] == "unauthenticated"
-    assert services["http://svc.example.com"]["auth_method"] == "basic"
+    assert services["https://svc.example.com:8080"]["auth_verdict"] == "unauthenticated"
+    assert services["http://svc.example.com"]["auth_verdict"] == "basic"
     # All three share the one hostname's resolved IPs.
     assert all(s["ips"] == ["10.0.0.5"] for s in services.values())
 
