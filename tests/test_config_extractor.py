@@ -647,7 +647,7 @@ def test_write_results_services_map_collapses_and_filters(tmp_path):
         origin="js: https://app/bundle.js",
         urls_found=[
             "https://svc.example.com/api",   # bearer
-            "https://svc.example.com/",      # none -> host is mixed
+            "https://svc.example.com/",      # unauthenticated -> host is mixed
             "https://down.example.com/x",    # resolved but probe failed
             "https://dead.example.com/y",    # unresolved -> excluded
         ],
@@ -657,7 +657,7 @@ def test_write_results_services_map_collapses_and_filters(tmp_path):
             "https://svc.example.com/api", AuthMethod.BEARER, status=401,
             note="challenged at /api"),
         "https://svc.example.com/": _auth_info(
-            "https://svc.example.com/", AuthMethod.NONE),
+            "https://svc.example.com/", AuthMethod.UNAUTHENTICATED),
         "https://down.example.com/x": _auth_info(
             "https://down.example.com/x", None, status=None,
             error="Cannot connect to host"),
@@ -730,7 +730,7 @@ def test_write_results_keys_services_by_origin(tmp_path):
         "https://svc.example.com:443/admin": _auth_info(
             "https://svc.example.com:443/admin", AuthMethod.NEGOTIATE, status=401),
         "https://svc.example.com:8080/x": _auth_info(
-            "https://svc.example.com:8080/x", AuthMethod.NONE),
+            "https://svc.example.com:8080/x", AuthMethod.UNAUTHENTICATED),
         "http://svc.example.com/y": _auth_info(
             "http://svc.example.com/y", AuthMethod.BASIC, status=401),
     }
@@ -754,7 +754,7 @@ def test_write_results_keys_services_by_origin(tmp_path):
     assert https_default["auth_method"] == "negotiate"
     assert https_default["mixed"] is False
     # Distinct port and distinct scheme keep their own verdicts.
-    assert services["https://svc.example.com:8080"]["auth_method"] == "none"
+    assert services["https://svc.example.com:8080"]["auth_method"] == "unauthenticated"
     assert services["http://svc.example.com"]["auth_method"] == "basic"
     # All three share the one hostname's resolved IPs.
     assert all(s["ips"] == ["10.0.0.5"] for s in services.values())
@@ -903,7 +903,7 @@ class TestClassifyProbe:
         assert _classify_probe(200, "Negotiate") == ("negotiate", None)
 
     def test_200_without_header(self):
-        assert _classify_probe(200, None) == ("none", None)
+        assert _classify_probe(200, None) == ("unauthenticated", None)
 
     def test_3xx_offhost_with_keyword_is_oauth(self):
         # Redirect off-host to an IdP whose URL carries an auth keyword:
@@ -1164,7 +1164,7 @@ async def test_probe_no_auth(auth_server):
     results = await probe_urls([f"{auth_server}/auth/none"], timeout=5.0)
     assert len(results) == 1
     assert results[0].status_code == 200
-    assert results[0].detected_method == "none"
+    assert results[0].detected_method == "unauthenticated"
 
 
 @pytest.mark.asyncio
@@ -1176,11 +1176,11 @@ async def test_probe_forbidden_keeps_verdict_and_probes_root(auth_server):
     assert len(path_probes) == 1
     assert path_probes[0].status_code == 403          # NOT overwritten by root
     assert path_probes[0].detected_method == "unknown"
-    # root (/) returns 200 -> none, kept as a separate synthesized probe
+    # root (/) returns 200 -> unauthenticated, kept as a separate synthesized probe
     assert len(root_probes) == 1
     assert root_probes[0].url == f"{auth_server}/"
     assert root_probes[0].status_code == 200
-    assert root_probes[0].detected_method == "none"
+    assert root_probes[0].detected_method == "unauthenticated"
     # breadcrumb links the locked path to the open front door
     assert "host root is open" in path_probes[0].note
 
@@ -1189,7 +1189,7 @@ async def test_probe_forbidden_keeps_verdict_and_probes_root(auth_server):
 async def test_probe_forbidden_with_bearer_challenge(auth_server):
     """403 carrying a Bearer challenge (RFC 6750 insufficient_scope) must keep
     that challenge — the root fallback must NOT overwrite it with the host
-    root's 200/none."""
+    root's 200/unauthenticated."""
     results = await probe_urls([f"{auth_server}/auth/forbidden-bearer"], timeout=5.0)
     assert len(results) == 1
     assert results[0].status_code == 403
@@ -1222,10 +1222,11 @@ async def test_probe_bad_request_probes_root_no_breadcrumb(auth_server):
         [f"{auth_server}/auth/bad-request"], timeout=5.0)
     assert path_probes[0].status_code == 400
     assert path_probes[0].detected_method == "unknown"
-    # root probed, front door learned as an independent fact (/ is open -> none)
+    # root probed, front door learned as an independent fact
+    # (/ is open -> unauthenticated)
     assert len(root_probes) == 1
     assert root_probes[0].url.endswith("/")
-    assert root_probes[0].detected_method == "none"
+    assert root_probes[0].detected_method == "unauthenticated"
     # but no breadcrumb tying the 400 path to that root
     assert "host root" not in (path_probes[0].note or "")
 
@@ -1343,23 +1344,25 @@ async def test_probe_no_root_probe_when_root_only(auth_server):
     assert _host_root_url(f"{auth_server}/") is None
 
 
-def test_collapse_unknown_outranks_none():
+def test_collapse_unknown_outranks_unauthenticated():
     """An open endpoint (often the host root) must never mask a locked-but-
     undisclosed sibling in the host headline; a concrete scheme still wins."""
     assert _collapse_host_verdict(
-        {AuthMethod.UNKNOWN, AuthMethod.NONE}) == AuthMethod.UNKNOWN
+        {AuthMethod.UNKNOWN, AuthMethod.UNAUTHENTICATED}) == AuthMethod.UNKNOWN
     assert _collapse_host_verdict(
-        {AuthMethod.BASIC, AuthMethod.UNKNOWN, AuthMethod.NONE}) == AuthMethod.BASIC
+        {AuthMethod.BASIC, AuthMethod.UNKNOWN,
+         AuthMethod.UNAUTHENTICATED}) == AuthMethod.BASIC
 
 
 def test_merge_root_probes_inserts_synthesized():
     """A probed root that no config referenced is inserted as a synthesized entry."""
     auth_map = {"https://h/x": AuthInfo(url="https://h/x")}
     root = ProbeResult(url="https://h/", status_code=200, www_authenticate=None,
-                       detected_method=AuthMethod.NONE)
+                       detected_method=AuthMethod.UNAUTHENTICATED)
     merge_root_probes(auth_map, [root])
     assert auth_map["https://h/"].synthesized is True
-    assert auth_map["https://h/"].probe_result.detected_method == AuthMethod.NONE
+    assert (auth_map["https://h/"].probe_result.detected_method
+            == AuthMethod.UNAUTHENTICATED)
 
 
 def test_merge_root_probes_keeps_discovered_root_unmarked():

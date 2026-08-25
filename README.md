@@ -1,6 +1,6 @@
 # config-hunter
 
-A Playwright-based crawler that loads a web app, captures the JSON configs and JS chunks it fetches, and harvests every `http(s)` URL found inside them. Each discovered URL is then probed to classify its authentication scheme (Basic, Bearer, Negotiate/NTLM, OAuth redirect, none, etc.).
+A Playwright-based crawler that loads a web app, captures the JSON configs and JS chunks it fetches, and harvests every `http(s)` URL found inside them. Each discovered URL is then probed to classify its authentication scheme (Basic, Bearer, Negotiate/NTLM, OAuth redirect, unauthenticated, etc.).
 
 ## How it works
 
@@ -80,7 +80,7 @@ Results are emitted only as JSON, via `-o/--output`. Without it the crawl, DNS r
 
 - A `sources` array — each config source (network response, DOM script, JS chunk) with the clean URLs extracted from it and any parse `error`.
 - A `suspect_urls` array — URLs quarantined before probing as malformed or templated, each with its `reason` (`bad_host`, `template`) and the sources it came from.
-- A `services` map keyed by origin (`scheme://host[:port]`, with the scheme's default port normalized away). A service — not a bare hostname — is the unit of roll-up: two ports on one box, or `http` vs `https`, are treated as distinct services with their own collapsed `auth_method` (`basic`, `bearer`, `negotiate`, `oauth`, `none`, `unknown`, …), `status_codes`, and `notes`, since on an internal estate they usually are. Each entry's `ips` are the resolved addresses for the service's hostname (DNS has no port), so services sharing a host share their IPs.
+- A `services` map keyed by origin (`scheme://host[:port]`, with the scheme's default port normalized away). A service — not a bare hostname — is the unit of roll-up: two ports on one box, or `http` vs `https`, are treated as distinct services with their own collapsed `auth_method` (`basic`, `bearer`, `negotiate`, `oauth`, `unauthenticated`, `unknown`, …), `status_codes`, and `notes`, since on an internal estate they usually are. Each entry's `ips` are the resolved addresses for the service's hostname (DNS has no port), so services sharing a host share their IPs.
 - An `unresolved_hosts` array — hosts referenced in configs that failed DNS resolution from the scanner's network position (each entry has `host` and an `error` reason such as `NXDOMAIN`, `SERVFAIL`, or `timeout`). URLs on unresolved hosts are skipped during the probe pass.
 - An `auth` map keyed by URL — the per-URL probe result (`status_code`, `www_authenticate`, `detected_method`, `note`, `error`). Host roots probed on the scanner's own initiative to disclose an undisclosed scheme are flagged `synthesized`.
 

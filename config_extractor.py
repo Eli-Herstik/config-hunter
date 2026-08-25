@@ -46,7 +46,7 @@ class AuthMethod(StrEnum):
     OTHER = "other"
     OAUTH = "oauth"
     LOGIN_REDIRECT = "login_redirect"
-    NONE = "none"
+    UNAUTHENTICATED = "unauthenticated"
     UNKNOWN = "unknown"
 
 
@@ -57,16 +57,16 @@ class ProbeResult:
     status_code: int | None
     www_authenticate: str | None
     # Auth verdict, an AuthMethod (one of BASIC/BEARER/NEGOTIATE/NTLM/OTHER/
-    # OAUTH/LOGIN_REDIRECT/NONE/UNKNOWN). None only on transport error (see
-    # `error`).
+    # OAUTH/LOGIN_REDIRECT/UNAUTHENTICATED/UNKNOWN). None only on transport
+    # error (see `error`).
     detected_method: AuthMethod | None
     # Short human-readable context, set when the verdict is inconclusive or
     # coarse — e.g. "forbidden (403)", "not found (404)", "server error: 503
     # Service Unavailable", "challenge scheme: digest" (naming an OTHER verdict),
     # "redirects off-origin to sso.corp.local". None when the verdict already
-    # says everything (a named scheme, NONE, a clean redirect). Distinct from
-    # `error`, which is reserved for transport failures (a 5xx is a successful
-    # HTTP transaction, so it lands here).
+    # says everything (a named scheme, UNAUTHENTICATED, a clean redirect).
+    # Distinct from `error`, which is reserved for transport failures (a 5xx is
+    # a successful HTTP transaction, so it lands here).
     note: str | None = None
     error: str | None = None
 
@@ -180,7 +180,7 @@ def _classify_probe(status: int, www_auth: str | None, location: str = "",
     if status == 403:
         return AuthMethod.UNKNOWN, "forbidden (403)"
     if 200 <= status < 300:
-        return AuthMethod.NONE, None
+        return AuthMethod.UNAUTHENTICATED, None
     if 300 <= status < 400:
         return _classify_redirect(location, url)
     if status == 400:
@@ -294,8 +294,8 @@ async def probe_urls_with_roots(
 
     Returns (path_probes, root_probes). root_probes are for synthesized
     host-root URLs not already in `urls`, filtered to those that disclosed
-    something useful (a concrete scheme, or NONE = 'front door open'); UNKNOWN
-    or errored roots add nothing and are dropped. The path keeps its own
+    something useful (a concrete scheme, or UNAUTHENTICATED = 'front door
+    open'); UNKNOWN or errored roots add nothing and are dropped. The path keeps its own
     verdict — the root is never substituted into it."""
     kw = dict(timeout=timeout, max_concurrent=max_concurrent,
               cookies=cookies, headers=headers)
@@ -332,7 +332,8 @@ async def probe_urls_with_roots(
         if gets_breadcrumb(p):
             m = disclosed.get(urlparse(p.url).hostname)
             if m is not None:
-                hint = ("; host root is open (none)" if m is AuthMethod.NONE
+                hint = ("; host root is open (unauthenticated)"
+                        if m is AuthMethod.UNAUTHENTICATED
                         else f"; host root discloses {m.value}")
                 p.note = (p.note or "") + hint
     return path_probes, root_probes
@@ -1251,8 +1252,8 @@ async def crawl(
 # Precedence for collapsing a host's per-URL auth verdicts into one headline
 # method. Earlier wins: a concrete challenge scheme is the most informative
 # answer to "how does this service authenticate", redirect-based flows come
-# next, NONE ("definitively open") below those, and UNKNOWN ("inconclusive")
-# last so it never masks a real verdict. Transport errors (detected_method is
+# next, UNAUTHENTICATED ("definitively open") below those, and UNKNOWN
+# ("inconclusive") last so it never masks a real verdict. Transport errors (detected_method is
 # None) are not auth verdicts — they're counted as `unreachable`, not ranked.
 _VERDICT_PRECEDENCE: tuple[AuthMethod, ...] = (
     AuthMethod.NEGOTIATE,
@@ -1262,13 +1263,13 @@ _VERDICT_PRECEDENCE: tuple[AuthMethod, ...] = (
     AuthMethod.OTHER,
     AuthMethod.OAUTH,
     AuthMethod.LOGIN_REDIRECT,
-    # UNKNOWN outranks NONE on purpose: a path we couldn't clear (401/403,
-    # scheme undisclosed) is the thing a reader must look at before exposure.
-    # If NONE won, one open endpoint (often the host root) would mask a
-    # restricted sibling in the host headline — the false negative this scan
-    # exists to catch. A concrete scheme still outranks both.
+    # UNKNOWN outranks UNAUTHENTICATED on purpose: a path we couldn't clear
+    # (401/403, scheme undisclosed) is the thing a reader must look at before
+    # exposure. If UNAUTHENTICATED won, one open endpoint (often the host root)
+    # would mask a restricted sibling in the host headline — the false negative
+    # this scan exists to catch. A concrete scheme still outranks both.
     AuthMethod.UNKNOWN,
-    AuthMethod.NONE,
+    AuthMethod.UNAUTHENTICATED,
 )
 
 
