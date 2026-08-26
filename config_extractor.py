@@ -112,6 +112,34 @@ def _host_root_url(url: str) -> str | None:
     return None
 
 
+_DEFAULT_PORTS = {"http": 80, "https": 443}
+
+
+def _service_key(url: str) -> str | None:
+    """Normalize a URL to its origin (scheme://host[:port]) — the module's
+    service identity. On an internal estate a hostname is not a service: two
+    ports on one box, or http vs https, are usually distinct services with their
+    own auth, and collapsing them by bare hostname would hide a gated sibling
+    behind an open one. The scheme's default port is stripped so https://h and
+    https://h:443 (and http://h / http://h:80) name one service, not two.
+    Returns None if the URL has no host.
+
+    Used both to roll auth verdicts up in the report and to scope the host-root
+    breadcrumb in probe_urls_with_roots — the two places one origin's evidence
+    must not leak onto another's."""
+    parsed = urlparse(url)
+    host = parsed.hostname
+    if not host:
+        return None
+    try:
+        port = parsed.port
+    except ValueError:  # out-of-range port; treat as unspecified
+        port = None
+    if port is not None and port != _DEFAULT_PORTS.get(parsed.scheme):
+        return f"{parsed.scheme}://{host}:{port}"
+    return f"{parsed.scheme}://{host}"
+
+
 async def _do_probe_request(
     session: aiohttp.ClientSession,
     url: str,
@@ -327,10 +355,22 @@ async def probe_urls_with_roots(
     # Breadcrumb: point each undisclosed *gated* path (401/403) at the front door
     # that explains it, since once the root is a separate entry nothing else links
     # them in the per-URL view. 400 paths trigger the probe but get no breadcrumb.
-    disclosed = {urlparse(r.url).hostname: r.detected_method for r in root_probes}
+    #
+    # Matched by _service_key (origin), not by hostname: the root we probed is
+    # already origin-scoped (_host_root_url keeps scheme and port), so matching on
+    # the bare hostname would let one origin's front door explain a path on a
+    # different port or scheme of the same box — the cross-origin merge the report
+    # is careful to avoid. Two ports on one host are two services with their own
+    # auth; "host root discloses ntlm" on the wrong one is a fabricated finding.
+    disclosed: dict[str, AuthMethod] = {}
+    for r in root_probes:
+        svc = _service_key(r.url)
+        if svc:
+            disclosed[svc] = r.detected_method
     for p in path_probes:
         if gets_breadcrumb(p):
-            m = disclosed.get(urlparse(p.url).hostname)
+            svc = _service_key(p.url)
+            m = disclosed.get(svc) if svc else None
             if m is not None:
                 hint = ("; host root is open (unauthenticated)"
                         if m is AuthMethod.UNAUTHENTICATED
@@ -1303,30 +1343,6 @@ def _collapse_host_verdict(verdicts: set[AuthMethod]) -> AuthMethod | None:
         if method in verdicts:
             return method
     return None
-
-
-_DEFAULT_PORTS = {"http": 80, "https": 443}
-
-
-def _service_key(url: str) -> str | None:
-    """Normalize a URL to its origin (scheme://host[:port]) — the identity we
-    roll auth verdicts up by. On an internal estate a hostname is not a service:
-    two ports on one box, or http vs https, are usually distinct services with
-    their own auth, and collapsing them by bare hostname would hide a gated
-    sibling behind an open one. The scheme's default port is stripped so
-    https://h and https://h:443 (and http://h / http://h:80) name one service,
-    not two. Returns None if the URL has no host."""
-    parsed = urlparse(url)
-    host = parsed.hostname
-    if not host:
-        return None
-    try:
-        port = parsed.port
-    except ValueError:  # out-of-range port; treat as unspecified
-        port = None
-    if port is not None and port != _DEFAULT_PORTS.get(parsed.scheme):
-        return f"{parsed.scheme}://{host}:{port}"
-    return f"{parsed.scheme}://{host}"
 
 
 def write_results(

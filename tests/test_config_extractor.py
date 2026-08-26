@@ -5,6 +5,7 @@ import json
 import sys
 import os
 import threading
+from urllib.parse import urlparse
 
 import pytest
 import pytest_asyncio
@@ -977,8 +978,12 @@ AUTH_CONFIG_JSON = json.dumps({
 })
 
 
-def _create_auth_app():
-    """Create test server with auth-aware routes."""
+def _create_auth_app(gated_root: bool = False):
+    """Create test server with auth-aware routes.
+
+    gated_root makes `/` answer a Basic challenge instead of serving the index,
+    so a second instance on another port is a *distinguishable* service sharing
+    one hostname — what the cross-origin breadcrumb test needs."""
     app = web.Application()
 
     async def handle_index(request):
@@ -1073,7 +1078,16 @@ def _create_auth_app():
             text="Unauthorized",
         )
 
-    app.router.add_get("/", handle_index)
+    async def handle_gated_root(request):
+        return web.Response(
+            status=401,
+            headers={"WWW-Authenticate": 'Basic realm="gated"'},
+            text="Unauthorized",
+        )
+
+    # add_get registers HEAD too (allow_head defaults True), which is what the
+    # root probe issues.
+    app.router.add_get("/", handle_gated_root if gated_root else handle_index)
     app.router.add_get("/config.json", handle_config_json)
     app.router.add_get("/api/settings.json", handle_settings_json)
     app.router.add_get("/auth/basic", handle_basic_auth)
@@ -1106,9 +1120,9 @@ def _create_auth_app():
     return app
 
 
-def _start_auth_server():
+def _start_auth_server(gated_root: bool = False):
     loop = asyncio.new_event_loop()
-    app = _create_auth_app()
+    app = _create_auth_app(gated_root=gated_root)
     runner = web.AppRunner(app)
     started = threading.Event()
     port_holder = [0]
@@ -1138,6 +1152,15 @@ def _start_auth_server():
 @pytest.fixture(scope="module")
 def auth_server():
     base_url, cleanup = _start_auth_server()
+    yield base_url
+    cleanup()
+
+
+@pytest.fixture(scope="module")
+def gated_auth_server():
+    """A second server on another port — same hostname as `auth_server`, so the
+    two are distinct origins on one box — whose root answers a Basic challenge."""
+    base_url, cleanup = _start_auth_server(gated_root=True)
     yield base_url
     cleanup()
 
@@ -1183,6 +1206,34 @@ async def test_probe_forbidden_keeps_verdict_and_probes_root(auth_server):
     assert root_probes[0].detected_method == "unauthenticated"
     # breadcrumb links the locked path to the open front door
     assert "host root is open" in path_probes[0].note
+
+
+@pytest.mark.asyncio
+async def test_breadcrumb_does_not_cross_origins(auth_server, gated_auth_server):
+    """Two ports on one hostname are two services, each with its own front door.
+    A gated path must get the breadcrumb from *its own* origin's root. Matching
+    the roots by bare hostname let whichever root was probed last explain every
+    gated path on the box — reporting an auth scheme for a service that was never
+    probed that way, which is exactly the cross-origin merge _service_key exists
+    to prevent in the report."""
+    open_root = f"{auth_server}/auth/forbidden"          # this origin's / is 200
+    gated_root = f"{gated_auth_server}/auth/forbidden"   # this origin's / is 401 Basic
+
+    # Same host, different ports — indistinguishable to a hostname-keyed match.
+    assert urlparse(open_root).hostname == urlparse(gated_root).hostname
+    assert urlparse(open_root).port != urlparse(gated_root).port
+
+    path_probes, root_probes = await probe_urls_with_roots(
+        [open_root, gated_root], timeout=5.0)
+
+    # Both front doors were probed, as two separate services.
+    assert {r.url for r in root_probes} == {f"{auth_server}/", f"{gated_auth_server}/"}
+
+    notes = {p.url: (p.note or "") for p in path_probes}
+    assert "host root is open" in notes[open_root]
+    assert "discloses basic" not in notes[open_root]        # the neighbour's verdict
+    assert "host root discloses basic" in notes[gated_root]
+    assert "is open" not in notes[gated_root]
 
 
 @pytest.mark.asyncio
