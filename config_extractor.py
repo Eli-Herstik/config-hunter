@@ -1369,10 +1369,12 @@ def write_results(
                 entry["sources"].append(src.origin)
 
     services: set[str] = set()
-    for u in all_clean:
+    service_urls: dict[str, list[str]] = {}
+    for u in sorted(all_clean):
         svc = _service_key(u)
         if svc:
             services.add(svc)
+            service_urls.setdefault(svc, []).append(u)
 
     # Per-service roll-up of the auth probes: one collapsed verdict per service,
     # where a service is an origin (scheme://host[:port], default port stripped —
@@ -1393,7 +1395,14 @@ def write_results(
     # which endpoint disagreed when `mixed`; `mixed` flags a service whose URLs
     # disagreed; and `unreachable` counts URLs that resolved but failed to probe
     # (transport error, no status), so a DNS-OK-but-dead service isn't misread as
-    # "no auth".
+    # "no auth". `urls` is every clean discovered URL belonging to the service,
+    # sorted — the inventory behind all of the above, and the thing that makes a
+    # service entry readable on its own instead of only through the flat `auth`
+    # section. It is built from what the configs actually referenced, so a host
+    # root synthesized by probe_urls_with_roots is deliberately absent (the same
+    # reason AuthInfo.synthesized exists: the output must never imply the app
+    # referenced `/` when it didn't). That is also why `urls_probed`, counted from
+    # the probes, can exceed len(urls) — by exactly the synthesized root.
     unresolved_set = {e["host"] for e in unresolved} if unresolved else set()
     resolved_services = {s for s in services
                          if urlparse(s).hostname not in unresolved_set}
@@ -1422,6 +1431,9 @@ def write_results(
             "urls_probed": len(probes),
             "unreachable": sum(1 for _, p in probes
                                if not p or p.detected_method is None),
+            # Last: the only unbounded field, so the verdict stays at the top of
+            # each service block.
+            "urls": service_urls.get(svc, []),
         }
 
     suspect_urls = [

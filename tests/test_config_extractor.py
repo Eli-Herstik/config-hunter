@@ -761,6 +761,87 @@ def test_write_results_keys_services_by_origin(tmp_path):
     assert all(s["ips"] == ["10.0.0.5"] for s in services.values())
 
 
+def test_write_results_services_list_their_urls(tmp_path):
+    """Each service carries `urls`: every clean discovered URL on that origin,
+    sorted. Origin-scoped like the rest of the entry, so a second port on the
+    same box gets its own list rather than sharing one."""
+    sources = [
+        ConfigSource(
+            origin="js: https://app/bundle.js",
+            urls_found=[
+                "https://svc.example.com/z-api",
+                "https://svc.example.com:8443/admin",   # distinct service
+                "https://dead.example.com/gone",        # unresolved -> no entry
+                "https://svc.example.com/${env}/tpl",   # suspect -> not a URL
+            ],
+        ),
+        ConfigSource(  # a second source referencing one of the same URLs
+            origin="network: https://svc.example.com/config.json",
+            urls_found=[
+                "https://svc.example.com/a-api",
+                "https://svc.example.com/z-api",
+            ],
+        ),
+    ]
+    auth_map = {u: _auth_info(u, AuthMethod.UNAUTHENTICATED) for u in (
+        "https://svc.example.com/z-api",
+        "https://svc.example.com/a-api",
+        "https://svc.example.com:8443/admin",
+    )}
+    unresolved = [{"host": "dead.example.com", "error": "NXDOMAIN"}]
+    ip_map = {"svc.example.com": ["10.0.0.5"]}
+
+    out = tmp_path / "r.json"
+    write_results(sources, str(out), auth_map, unresolved, ip_map)
+    with open(out, "r", encoding="utf-8") as f:
+        data = json.load(f)
+
+    services = data["services"]
+    # Sorted, deduped across sources, and the templated URL is quarantined out.
+    assert services["https://svc.example.com"]["urls"] == [
+        "https://svc.example.com/a-api",
+        "https://svc.example.com/z-api",
+    ]
+    # The other port's URL didn't leak into the first service's list.
+    assert services["https://svc.example.com:8443"]["urls"] == [
+        "https://svc.example.com:8443/admin",
+    ]
+    assert "https://dead.example.com" not in services
+
+
+def test_write_results_services_urls_exclude_synthesized_roots(tmp_path):
+    """A host root we probed on our own initiative is not something the config
+    referenced, so it stays out of `urls` — which is why `urls_probed` (counted
+    from the probes) can exceed len(urls)."""
+    sources = [ConfigSource(
+        origin="js: https://app/bundle.js",
+        urls_found=["https://svc.example.com/api"],
+    )]
+    auth_map = {
+        "https://svc.example.com/api": _auth_info(
+            "https://svc.example.com/api", AuthMethod.UNKNOWN, status=401,
+            note="auth required, scheme undisclosed; host root discloses ntlm"),
+        "https://svc.example.com/": AuthInfo(
+            url="https://svc.example.com/",
+            probe_result=ProbeResult(
+                url="https://svc.example.com/", status_code=401,
+                www_authenticate="NTLM", detected_method=AuthMethod.NTLM),
+            synthesized=True,
+        ),
+    }
+    out = tmp_path / "r.json"
+    write_results(sources, str(out), auth_map, [], {"svc.example.com": ["10.0.0.5"]})
+    with open(out, "r", encoding="utf-8") as f:
+        data = json.load(f)
+
+    svc = data["services"]["https://svc.example.com"]
+    assert svc["urls"] == ["https://svc.example.com/api"]
+    assert svc["urls_probed"] == 2          # the synthesized root was probed
+    assert svc["auth_verdict"] == "ntlm"    # and still shapes the verdict
+    # The synthesized root remains visible in the flat per-URL view.
+    assert data["auth"]["https://svc.example.com/"]["synthesized"] is True
+
+
 @pytest.mark.asyncio
 async def test_default_single_url_unchanged(test_server):
     """Without follow_links, the deep route and the cookie-gated API must NOT appear."""
