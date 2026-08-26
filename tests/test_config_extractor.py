@@ -1354,6 +1354,29 @@ def test_collapse_unknown_outranks_unauthenticated():
          AuthMethod.UNAUTHENTICATED}) == AuthMethod.BASIC
 
 
+def test_collapse_ranks_by_blocker_risk():
+    """The headline is the worst thing found across a service's URLs, not the
+    most informative one: hard blockers (ntlm/basic/other) outrank the
+    needs-review tier (negotiate), which outranks the exposable schemes."""
+    # A blocker is never masked by a scheme that would pass exposure review.
+    assert _collapse_host_verdict(
+        {AuthMethod.NTLM, AuthMethod.NEGOTIATE}) == AuthMethod.NTLM
+    assert _collapse_host_verdict(
+        {AuthMethod.BASIC, AuthMethod.BEARER,
+         AuthMethod.NEGOTIATE}) == AuthMethod.BASIC
+    assert _collapse_host_verdict(
+        {AuthMethod.OTHER, AuthMethod.BEARER}) == AuthMethod.OTHER
+    # Needs-review outranks known-good, so an ambiguous negotiate isn't hidden
+    # behind a bearer sibling.
+    assert _collapse_host_verdict(
+        {AuthMethod.NEGOTIATE, AuthMethod.BEARER,
+         AuthMethod.LOGIN_REDIRECT}) == AuthMethod.NEGOTIATE
+    # A concrete exposable verdict still beats the inconclusive catch-all, which
+    # is dominated by 404s from stale config URLs.
+    assert _collapse_host_verdict(
+        {AuthMethod.BEARER, AuthMethod.UNKNOWN}) == AuthMethod.BEARER
+
+
 def test_merge_root_probes_inserts_synthesized():
     """A probed root that no config referenced is inserted as a synthesized entry."""
     auth_map = {"https://h/x": AuthInfo(url="https://h/x")}

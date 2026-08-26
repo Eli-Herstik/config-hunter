@@ -1249,25 +1249,47 @@ async def crawl(
 # Reporting
 # ---------------------------------------------------------------------------
 
-# Precedence for collapsing a host's per-URL auth verdicts into one headline
-# method. Earlier wins: a concrete challenge scheme is the most informative
-# answer to "how does this service authenticate", redirect-based flows come
-# next, UNAUTHENTICATED ("definitively open") below those, and UNKNOWN
-# ("inconclusive") last so it never masks a real verdict. Transport errors (detected_method is
-# None) are not auth verdicts — they're counted as `unreachable`, not ranked.
+# Precedence for collapsing a service's per-URL auth verdicts into one headline
+# method. Earlier wins. The sort is by *blocker risk*, not by informativeness:
+# the question this report answers is "can this service go behind the F5, and if
+# not, why not", so the headline is the worst thing found across the service's
+# URLs. It only decides the headline when a service's URLs disagreed (see
+# `mixed`); nothing about probing or classification depends on it. Transport
+# errors (detected_method is None) are not auth verdicts — they're counted as
+# `unreachable`, not ranked.
 _VERDICT_PRECEDENCE: tuple[AuthMethod, ...] = (
-    AuthMethod.NEGOTIATE,
+    # --- Blockers: exposure can't proceed as-is. ---
+    # Technical blocker. NTLM authenticates the TCP connection, not the request,
+    # so connection reuse/multiplexing at the proxy breaks the handshake.
     AuthMethod.NTLM,
-    AuthMethod.BEARER,
+    # Policy blocker, not a technical one — BASIC proxies fine. The objection is
+    # that credentials ride every request, and exposure sends them outward.
     AuthMethod.BASIC,
+    # A named scheme we don't recognize (Digest, vendor schemes; the note says
+    # which). Ranked as a blocker by safe default — unrecognized means unsupported
+    # until someone confirms otherwise — not because any specific scheme is known
+    # to fail. Epistemically this is NEGOTIATE's tier; it sits above only because
+    # the safe assumption differs.
     AuthMethod.OTHER,
+    # --- Needs review: may or may not block; a human has to look. ---
+    # Kerberos underneath is fine to expose; NTLM underneath is a blocker, and
+    # the challenge alone doesn't say which.
+    AuthMethod.NEGOTIATE,
+    # --- Exposable: concrete and known-good. ---
+    AuthMethod.BEARER,
     AuthMethod.OAUTH,
     AuthMethod.LOGIN_REDIRECT,
-    # UNKNOWN outranks UNAUTHENTICATED on purpose: a path we couldn't clear
-    # (401/403, scheme undisclosed) is the thing a reader must look at before
-    # exposure. If UNAUTHENTICATED won, one open endpoint (often the host root)
-    # would mask a restricted sibling in the host headline — the false negative
-    # this scan exists to catch. A concrete scheme still outranks both.
+    # UNKNOWN stays below the concrete verdicts and above UNAUTHENTICATED. By the
+    # NEGOTIATE argument it belongs in the review tier — a 401/403 with no
+    # WWW-Authenticate could be hiding NTLM. But UNKNOWN is a catch-all that also
+    # absorbs 404/400/5xx/407 and plain non-auth redirects, and stale URLs
+    # harvested from JS bundles 404 constantly, so promoting the whole bucket
+    # would flag most services for review on the strength of one dead path.
+    # Splitting out a distinct "gated, scheme undisclosed" verdict (401/403) is
+    # what would earn a spot next to NEGOTIATE.
+    # It still outranks UNAUTHENTICATED: if open won, one open endpoint (often the
+    # host root) would mask a restricted sibling in the headline — the false
+    # negative this scan exists to catch.
     AuthMethod.UNKNOWN,
     AuthMethod.UNAUTHENTICATED,
 )
