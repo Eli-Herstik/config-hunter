@@ -60,11 +60,14 @@ class ProbeResult:
     # OAUTH/LOGIN_REDIRECT/UNAUTHENTICATED/UNKNOWN). None only on transport
     # error (see `error`).
     detected_method: AuthMethod | None
-    # Short human-readable context, set when the verdict is inconclusive or
-    # coarse — e.g. "forbidden (403)", "not found (404)", "server error: 503
-    # Service Unavailable", "challenge scheme: digest" (naming an OTHER verdict),
-    # "redirects off-origin to sso.corp.local". None when the verdict already
-    # says everything (a named scheme, UNAUTHENTICATED, a clean redirect).
+    # Short human-readable context, set only when it carries something neither
+    # the verdict nor `status_code` already does — e.g. "auth required, scheme
+    # undisclosed" (asserting the *absence* of a challenge header), "server
+    # error: 503 Service Unavailable" (the server's reason phrase, emitted
+    # nowhere else), "challenge scheme: digest" (naming an OTHER verdict),
+    # "redirects off-origin to sso.corp.local". None when the verdict and status
+    # already say everything: a named scheme, UNAUTHENTICATED, a clean redirect,
+    # or a coarse 4xx (400/403/404/407) whose reason phrase the number conveys.
     # Distinct from `error`, which is reserved for transport failures (a 5xx is
     # a successful HTTP transaction, so it lands here).
     note: str | None = None
@@ -194,9 +197,10 @@ def _classify_probe(status: int, www_auth: str | None, location: str = "",
     """Classify a probe response into (detected_method, note).
 
     detected_method is an AuthMethod verdict; note is a short human-readable
-    string set only when the verdict is inconclusive or coarse (why we couldn't
-    pin a method, a heads-up like a proxy / off-origin redirect, or the specific
-    scheme behind an OTHER verdict); it is None otherwise."""
+    string set only when it adds something the verdict and the status code don't
+    already carry (why we couldn't pin a method, an off-origin redirect target,
+    the server's reason phrase, or the specific scheme behind an OTHER verdict);
+    it is None otherwise."""
     # A WWW-Authenticate challenge is authoritative on any status, not just
     # 401. RFC 6750 (OAuth Bearer) returns it on 403 for insufficient_scope,
     # and the header MAY appear on other statuses per RFC 7235 §4.1.
@@ -205,18 +209,12 @@ def _classify_probe(status: int, www_auth: str | None, location: str = "",
     if status == 401:
         # Auth is required, but the server didn't disclose the scheme.
         return AuthMethod.UNKNOWN, "auth required, scheme undisclosed"
-    if status == 403:
-        return AuthMethod.UNKNOWN, "forbidden (403)"
+    if status in (400, 403, 404, 407):
+        return AuthMethod.UNKNOWN, None
     if 200 <= status < 300:
         return AuthMethod.UNAUTHENTICATED, None
     if 300 <= status < 400:
         return _classify_redirect(location, url)
-    if status == 400:
-        return AuthMethod.UNKNOWN, "bad request (400)"
-    if status == 404:
-        return AuthMethod.UNKNOWN, "not found (404)"
-    if status == 407:
-        return AuthMethod.UNKNOWN, "proxy authentication required (407)"
     if 500 <= status < 600:
         detail = f"{status} {reason}".strip()
         return AuthMethod.UNKNOWN, f"server error: {detail}"
@@ -372,10 +370,10 @@ async def probe_urls_with_roots(
             svc = _service_key(p.url)
             m = disclosed.get(svc) if svc else None
             if m is not None:
-                hint = ("; host root is open (unauthenticated)"
+                hint = ("host root is open (unauthenticated)"
                         if m is AuthMethod.UNAUTHENTICATED
-                        else f"; host root discloses {m.value}")
-                p.note = (p.note or "") + hint
+                        else f"host root discloses {m.value}")
+                p.note = f"{p.note}; {hint}" if p.note else hint
     return path_probes, root_probes
 
 

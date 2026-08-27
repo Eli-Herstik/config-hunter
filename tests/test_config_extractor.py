@@ -976,21 +976,24 @@ class TestClassifyProbe:
 
     def test_403_with_bearer_challenge(self):
         # RFC 6750 insufficient_scope: 403 carries a Bearer challenge, which
-        # must win over the opaque "forbidden" note.
+        # must win over the bare unknown verdict a note-free 403 would get.
         assert _classify_probe(403, 'Bearer error="insufficient_scope"') == ("bearer", None)
 
-    def test_403_without_header(self):
-        assert _classify_probe(403, None) == ("unknown", "forbidden (403)")
+    # The coarse 4xx statuses carry no note: status_code is emitted beside the
+    # verdict, so a note restating the status's reason phrase ("forbidden
+    # (403)") only duplicated it. Each still needs its own arm — falling through
+    # would mislabel them "unexpected status".
+    def test_403_without_header_has_no_note(self):
+        assert _classify_probe(403, None) == ("unknown", None)
 
-    def test_400_is_a_note(self):
-        assert _classify_probe(400, None) == ("unknown", "bad request (400)")
+    def test_400_has_no_note(self):
+        assert _classify_probe(400, None) == ("unknown", None)
 
-    def test_404_is_a_note(self):
-        assert _classify_probe(404, None) == ("unknown", "not found (404)")
+    def test_404_has_no_note(self):
+        assert _classify_probe(404, None) == ("unknown", None)
 
-    def test_407_proxy_auth_is_a_note(self):
-        # A proxy in the path is a topology heads-up, not the service's method.
-        assert _classify_probe(407, None) == ("unknown", "proxy authentication required (407)")
+    def test_407_has_no_note(self):
+        assert _classify_probe(407, None) == ("unknown", None)
 
     def test_5xx_note_carries_reason_phrase(self):
         # The server's reason phrase rides along — 502/503/504 distinguish
@@ -1306,8 +1309,9 @@ async def test_probe_forbidden_keeps_verdict_and_probes_root(auth_server):
     assert root_probes[0].url == f"{auth_server}/"
     assert root_probes[0].status_code == 200
     assert root_probes[0].detected_method == "unauthenticated"
-    # breadcrumb links the locked path to the open front door
-    assert "host root is open" in path_probes[0].note
+    # breadcrumb links the locked path to the open front door. The 403 has no
+    # note of its own, so the breadcrumb is the whole note — no leading "; ".
+    assert path_probes[0].note == "host root is open (unauthenticated)"
 
 
 @pytest.mark.asyncio
