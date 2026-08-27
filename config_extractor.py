@@ -1345,6 +1345,37 @@ def _collapse_host_verdict(verdicts: set[AuthMethod]) -> AuthMethod | None:
     return None
 
 
+def _url_evidence(info: "AuthInfo | None") -> dict:
+    """Render one URL's probe evidence as emitted under a service's `urls`.
+
+    Null fields are omitted rather than serialized: most probes set two or three
+    of the five, and spelling out the nulls cost more bytes than the evidence.
+    An empty dict is therefore a real answer — "discovered, never probed" — not a
+    missing one. `synthesized` marks a host root the scanner probed on its own
+    initiative (see AuthInfo.synthesized): it is listed among the service's URLs
+    because it is the evidence behind the verdict, and flagged because the config
+    never referenced it."""
+    entry: dict = {}
+    if info is None:
+        return entry
+    if info.synthesized:
+        entry["synthesized"] = True
+    p = info.probe_result
+    if p is None:
+        return entry
+    if p.status_code is not None:
+        entry["status_code"] = p.status_code
+    if p.www_authenticate is not None:
+        entry["www_authenticate"] = p.www_authenticate
+    if p.detected_method is not None:
+        entry["detected_method"] = p.detected_method
+    if p.note is not None:
+        entry["note"] = p.note
+    if p.error is not None:
+        entry["error"] = p.error
+    return entry
+
+
 def write_results(
     sources: list[ConfigSource],
     path: str,
@@ -1388,36 +1419,34 @@ def write_results(
     # `auth_verdict` is the highest-precedence AuthMethod seen across the
     # service's probed URLs (see _VERDICT_PRECEDENCE); `status_codes` lists the
     # distinct HTTP statuses observed — the evidence behind the verdict, and what
-    # disambiguates an `unknown` service (403 vs 404 vs 503); `notes` maps each
-    # probed URL that carried an inconclusive/coarse note to that note (the
-    # scheme behind an `other`, a redirect target, why a method couldn't be
-    # pinned) — the service-scoped view the flat `auth` section can't give, and
-    # which endpoint disagreed when `mixed`; `mixed` flags a service whose URLs
-    # disagreed; and `unreachable` counts URLs that resolved but failed to probe
-    # (transport error, no status), so a DNS-OK-but-dead service isn't misread as
-    # "no auth". `urls` is every clean discovered URL belonging to the service,
-    # sorted — the inventory behind all of the above, and the thing that makes a
-    # service entry readable on its own instead of only through the flat `auth`
-    # section. It is built from what the configs actually referenced, so a host
-    # root synthesized by probe_urls_with_roots is deliberately absent (the same
-    # reason AuthInfo.synthesized exists: the output must never imply the app
-    # referenced `/` when it didn't). That is also why `urls_probed`, counted from
-    # the probes, can exceed len(urls) — by exactly the synthesized root.
+    # disambiguates an `unknown` service (403 vs 404 vs 503); `mixed` flags a
+    # service whose URLs disagreed; and `unreachable` counts URLs that resolved
+    # but failed to probe (transport error, no status), so a DNS-OK-but-dead
+    # service isn't misread as "no auth".
+    #
+    # `urls` maps each of the service's URLs to its own probe evidence (see
+    # _url_evidence) — the scalars above are the skim layer, this is what they
+    # were collapsed from: which endpoint was the open one when `mixed`, which
+    # 403'd, the raw WWW-Authenticate behind an `other`, why a probe failed at the
+    # transport. It is the union of the clean URLs the configs referenced and any
+    # host root probed on our own initiative, the latter flagged `synthesized` so
+    # the output never implies the app referenced `/` when it didn't.
     unresolved_set = {e["host"] for e in unresolved} if unresolved else set()
     resolved_services = {s for s in services
                          if urlparse(s).hostname not in unresolved_set}
 
-    service_probes: dict[str, list[tuple[str, ProbeResult | None]]] = {}
+    service_auth: dict[str, dict[str, AuthInfo]] = {}
     if auth_map:
         for url, info in auth_map.items():
             svc = _service_key(url)
             if not svc:
                 continue
-            service_probes.setdefault(svc, []).append((url, info.probe_result))
+            service_auth.setdefault(svc, {})[url] = info
 
     services_section: dict = {}
     for svc in sorted(resolved_services):
-        probes = service_probes.get(svc, [])
+        infos = service_auth.get(svc, {})
+        probes = [(url, i.probe_result) for url, i in infos.items()]
         auth_verdicts = {p.detected_method for _, p in probes
                          if p and p.detected_method is not None}
         hostname = urlparse(svc).hostname
@@ -1426,14 +1455,14 @@ def write_results(
             "auth_verdict": _collapse_host_verdict(auth_verdicts),
             "status_codes": sorted({p.status_code for _, p in probes
                                     if p and p.status_code is not None}),
-            "notes": {url: p.note for url, p in sorted(probes) if p and p.note},
             "mixed": len(auth_verdicts) > 1,
             "urls_probed": len(probes),
             "unreachable": sum(1 for _, p in probes
                                if not p or p.detected_method is None),
             # Last: the only unbounded field, so the verdict stays at the top of
             # each service block.
-            "urls": service_urls.get(svc, []),
+            "urls": {url: _url_evidence(infos.get(url)) for url in
+                     sorted(set(service_urls.get(svc, [])) | set(infos))},
         }
 
     suspect_urls = [
@@ -1449,24 +1478,6 @@ def write_results(
     if unresolved is not None:
         output["services"] = services_section
         output["unresolved_hosts"] = unresolved
-
-    if auth_map:
-        auth_section: dict = {}
-        for url, info in sorted(auth_map.items()):
-            entry: dict = {}
-            if info.synthesized:
-                entry["synthesized"] = True
-            if info.probe_result:
-                p = info.probe_result
-                entry["probe"] = {
-                    "status_code": p.status_code,
-                    "www_authenticate": p.www_authenticate,
-                    "detected_method": p.detected_method,
-                    "note": p.note,
-                    "error": p.error,
-                }
-            auth_section[url] = entry
-        output["auth"] = auth_section
 
     with open(path, "w", encoding="utf-8") as f:
         json.dump(output, f, indent=2, ensure_ascii=False)

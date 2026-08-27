@@ -682,8 +682,15 @@ def test_write_results_services_map_collapses_and_filters(tmp_path):
     assert svc["ips"] == ["10.0.0.5"]  # joined through the hostname
     assert svc["auth_verdict"] == "bearer"  # concrete scheme outranks none
     assert svc["status_codes"] == [200, 401]  # distinct, sorted
-    # notes: keyed by the URL that carried one; the note-less `/` is absent
-    assert svc["notes"] == {"https://svc.example.com/api": "challenged at /api"}
+    # The evidence the scalars above were collapsed from: each URL's own verdict,
+    # its note if it carried one, and null fields omitted entirely.
+    assert svc["urls"] == {
+        "https://svc.example.com/": {
+            "status_code": 200, "detected_method": "unauthenticated"},
+        "https://svc.example.com/api": {
+            "status_code": 401, "detected_method": "bearer",
+            "note": "challenged at /api"},
+    }
     assert svc["mixed"] is True
     assert svc["urls_probed"] == 2
     assert svc["unreachable"] == 0
@@ -692,7 +699,11 @@ def test_write_results_services_map_collapses_and_filters(tmp_path):
     assert down["ips"] == ["10.0.0.6", "10.0.0.7"]  # multiple IPs preserved
     assert down["auth_verdict"] is None    # only a transport error, no verdict
     assert down["status_codes"] == []      # transport error carries no status
-    assert down["notes"] == {}             # transport error sets `error`, not a note
+    # The error string survives the collapse — `unreachable` alone would not say
+    # whether this host refused the connection, timed out, or failed TLS.
+    assert down["urls"] == {
+        "https://down.example.com/x": {"error": "Cannot connect to host"},
+    }
     assert down["mixed"] is False
     assert down["urls_probed"] == 1
     assert down["unreachable"] == 1
@@ -798,21 +809,25 @@ def test_write_results_services_list_their_urls(tmp_path):
 
     services = data["services"]
     # Sorted, deduped across sources, and the templated URL is quarantined out.
-    assert services["https://svc.example.com"]["urls"] == [
+    assert list(services["https://svc.example.com"]["urls"]) == [
         "https://svc.example.com/a-api",
         "https://svc.example.com/z-api",
     ]
+    # Each key carries that URL's own evidence, not just its name.
+    assert services["https://svc.example.com"]["urls"][
+        "https://svc.example.com/a-api"] == {
+            "status_code": 200, "detected_method": "unauthenticated"}
     # The other port's URL didn't leak into the first service's list.
-    assert services["https://svc.example.com:8443"]["urls"] == [
+    assert list(services["https://svc.example.com:8443"]["urls"]) == [
         "https://svc.example.com:8443/admin",
     ]
     assert "https://dead.example.com" not in services
 
 
-def test_write_results_services_urls_exclude_synthesized_roots(tmp_path):
-    """A host root we probed on our own initiative is not something the config
-    referenced, so it stays out of `urls` — which is why `urls_probed` (counted
-    from the probes) can exceed len(urls)."""
+def test_write_results_services_urls_flag_synthesized_roots(tmp_path):
+    """A host root probed on our own initiative is listed among the service's
+    URLs — it is the evidence behind the verdict — but flagged `synthesized`, so
+    the report never implies the config referenced `/`."""
     sources = [ConfigSource(
         origin="js: https://app/bundle.js",
         urls_found=["https://svc.example.com/api"],
@@ -835,11 +850,19 @@ def test_write_results_services_urls_exclude_synthesized_roots(tmp_path):
         data = json.load(f)
 
     svc = data["services"]["https://svc.example.com"]
-    assert svc["urls"] == ["https://svc.example.com/api"]
-    assert svc["urls_probed"] == 2          # the synthesized root was probed
-    assert svc["auth_verdict"] == "ntlm"    # and still shapes the verdict
-    # The synthesized root remains visible in the flat per-URL view.
-    assert data["auth"]["https://svc.example.com/"]["synthesized"] is True
+    assert svc["auth_verdict"] == "ntlm"       # the root's disclosure won
+    assert svc["urls_probed"] == 2
+    assert len(svc["urls"]) == 2               # and the counts reconcile
+    # The root is present with the raw challenge that produced the verdict,
+    # flagged as ours rather than the config's.
+    assert svc["urls"]["https://svc.example.com/"] == {
+        "synthesized": True, "status_code": 401,
+        "www_authenticate": "NTLM", "detected_method": "ntlm",
+    }
+    # The referenced path keeps its own weaker verdict, unflagged.
+    assert "synthesized" not in svc["urls"]["https://svc.example.com/api"]
+    assert svc["urls"]["https://svc.example.com/api"]["detected_method"] == "unknown"
+    assert "auth" not in data
 
 
 @pytest.mark.asyncio
@@ -1533,7 +1556,7 @@ def test_merge_root_probes_keeps_discovered_root_unmarked():
 
 @pytest.mark.asyncio
 async def test_write_results_with_auth(auth_server, tmp_path):
-    """Verify write_results includes auth section when auth_map is provided."""
+    """Probe evidence reaches the report under each service's `urls`."""
     sources = await crawl(auth_server, timeout=10000, wait_after_load=2000)
     all_urls = list({u for s in sources for u in s.urls_found})
     auth_map = {u: AuthInfo(url=u) for u in all_urls}
@@ -1541,16 +1564,22 @@ async def test_write_results_with_auth(auth_server, tmp_path):
     merge_probe_results(auth_map, probes)
 
     out_path = str(tmp_path / "results_auth.json")
-    write_results(sources, out_path, auth_map)
+    # unresolved=[] is the shape main() always passes: the DNS pass ran and every
+    # host resolved. `services` is gated on that pass having happened.
+    write_results(sources, out_path, auth_map, [], {})
 
     with open(out_path, "r", encoding="utf-8") as f:
         data = json.load(f)
 
-    assert "auth" in data
-    assert isinstance(data["auth"], dict)
-    for url, auth_entry in data["auth"].items():
-        assert "probe" in auth_entry
-        assert "detected_method" in auth_entry["probe"]
+    assert "auth" not in data          # folded away
+    services = data["services"]
+    assert services
+    probed = {url: ev for svc in services.values()
+              for url, ev in svc["urls"].items()}
+    assert probed
+    for url, evidence in probed.items():
+        # Every probed URL reports either a verdict or why it couldn't be reached.
+        assert "detected_method" in evidence or "error" in evidence
 
 
 # ===========================================================================
