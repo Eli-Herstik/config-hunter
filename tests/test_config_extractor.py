@@ -833,7 +833,7 @@ def test_write_results_services_urls_flag_synthesized_roots(tmp_path):
     auth_map = {
         "https://svc.example.com/api": _auth_info(
             "https://svc.example.com/api", AuthMethod.UNKNOWN, status=401,
-            note="auth required, scheme undisclosed; host root discloses ntlm"),
+            note="host root discloses ntlm"),
         "https://svc.example.com/": AuthInfo(
             url="https://svc.example.com/",
             probe_result=ProbeResult(
@@ -970,9 +970,10 @@ class TestClassifyProbe:
     def test_401_with_basic(self):
         assert _classify_probe(401, 'Basic realm="x"') == ("basic", None)
 
-    def test_401_without_header(self):
-        # Bare 401: auth required, but the scheme isn't disclosed.
-        assert _classify_probe(401, None) == ("unknown", "auth required, scheme undisclosed")
+    def test_401_without_header_has_no_note(self):
+        # Bare 401 = auth required, scheme undisclosed. No note: the (401,
+        # unknown, no www_authenticate) triple is unique to this case.
+        assert _classify_probe(401, None) == ("unknown", None)
 
     def test_403_with_bearer_challenge(self):
         # RFC 6750 insufficient_scope: 403 carries a Bearer challenge, which

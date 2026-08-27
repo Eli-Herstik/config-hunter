@@ -207,8 +207,12 @@ def _classify_probe(status: int, www_auth: str | None, location: str = "",
     if www_auth:
         return _parse_www_authenticate(www_auth)
     if status == 401:
-        # Auth is required, but the server didn't disclose the scheme.
-        return AuthMethod.UNKNOWN, "auth required, scheme undisclosed"
+        # Auth is required and the scheme wasn't disclosed — but the record
+        # already says exactly that, and says it uniquely: status 401 with no
+        # `www_authenticate` key is the bare-challenge case and nothing else
+        # produces it (a named scheme sets detected_method; a tokenless header
+        # keeps the header and notes "malformed").
+        return AuthMethod.UNKNOWN, None
     if status in (400, 403, 404, 407):
         return AuthMethod.UNKNOWN, None
     if 200 <= status < 300:
