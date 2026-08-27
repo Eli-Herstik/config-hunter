@@ -681,7 +681,6 @@ def test_write_results_services_map_collapses_and_filters(tmp_path):
     svc = services["https://svc.example.com"]
     assert svc["ips"] == ["10.0.0.5"]  # joined through the hostname
     assert svc["auth_verdict"] == "bearer"  # concrete scheme outranks none
-    assert svc["status_codes"] == [200, 401]  # distinct, sorted
     # The evidence the scalars above were collapsed from: each URL's own verdict,
     # its note if it carried one, and null fields omitted entirely.
     assert svc["urls"] == {
@@ -698,7 +697,6 @@ def test_write_results_services_map_collapses_and_filters(tmp_path):
     down = services["https://down.example.com"]
     assert down["ips"] == ["10.0.0.6", "10.0.0.7"]  # multiple IPs preserved
     assert down["auth_verdict"] is None    # only a transport error, no verdict
-    assert down["status_codes"] == []      # transport error carries no status
     # The error string survives the collapse — `unreachable` alone would not say
     # whether this host refused the connection, timed out, or failed TLS.
     assert down["urls"] == {

@@ -1417,17 +1417,16 @@ def write_results(
     # for that host — it can map to several (round-robin DNS, load balancers,
     # dual-stack), and shared IPs across services reveal a common backend.
     # `auth_verdict` is the highest-precedence AuthMethod seen across the
-    # service's probed URLs (see _VERDICT_PRECEDENCE); `status_codes` lists the
-    # distinct HTTP statuses observed — the evidence behind the verdict, and what
-    # disambiguates an `unknown` service (403 vs 404 vs 503); `mixed` flags a
-    # service whose URLs disagreed; and `unreachable` counts URLs that resolved
-    # but failed to probe (transport error, no status), so a DNS-OK-but-dead
-    # service isn't misread as "no auth".
+    # service's probed URLs (see _VERDICT_PRECEDENCE); `mixed` flags a service
+    # whose URLs disagreed; and `unreachable` counts URLs that resolved but
+    # failed to probe (transport error, no status), so a DNS-OK-but-dead service
+    # isn't misread as "no auth".
     #
     # `urls` maps each of the service's URLs to its own probe evidence (see
     # _url_evidence) — the scalars above are the skim layer, this is what they
     # were collapsed from: which endpoint was the open one when `mixed`, which
-    # 403'd, the raw WWW-Authenticate behind an `other`, why a probe failed at the
+    # 403'd — and so whether an `unknown` service is gated or merely full of stale
+    # 404s — the raw WWW-Authenticate behind an `other`, why a probe failed at the
     # transport. It is the union of the clean URLs the configs referenced and any
     # host root probed on our own initiative, the latter flagged `synthesized` so
     # the output never implies the app referenced `/` when it didn't.
@@ -1453,8 +1452,6 @@ def write_results(
         services_section[svc] = {
             "ips": (ip_map or {}).get(hostname, []),
             "auth_verdict": _collapse_host_verdict(auth_verdicts),
-            "status_codes": sorted({p.status_code for _, p in probes
-                                    if p and p.status_code is not None}),
             "mixed": len(auth_verdicts) > 1,
             "urls_probed": len(probes),
             "unreachable": sum(1 for _, p in probes
