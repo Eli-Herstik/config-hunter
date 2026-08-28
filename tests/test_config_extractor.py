@@ -629,12 +629,12 @@ def test_write_results_quarantines_suspect_urls(tmp_path):
         assert s["sources"] == ["js: https://test/bundle.js"]
 
 
-def _auth_info(url, method, *, status=200, note=None, error=None):
+def _auth_info(url, method, *, status=200, root_discloses=None, error=None):
     return AuthInfo(
         url=url,
         probe_result=ProbeResult(
             url=url, status_code=status, www_authenticate=None,
-            detected_method=method, note=note, error=error,
+            detected_method=method, root_discloses=root_discloses, error=error,
         ),
     )
 
@@ -655,8 +655,7 @@ def test_write_results_services_map_collapses_and_filters(tmp_path):
     )]
     auth_map = {
         "https://svc.example.com/api": _auth_info(
-            "https://svc.example.com/api", AuthMethod.BEARER, status=401,
-            note="challenged at /api"),
+            "https://svc.example.com/api", AuthMethod.BEARER, status=401),
         "https://svc.example.com/": _auth_info(
             "https://svc.example.com/", AuthMethod.UNAUTHENTICATED),
         "https://down.example.com/x": _auth_info(
@@ -681,14 +680,13 @@ def test_write_results_services_map_collapses_and_filters(tmp_path):
     svc = services["https://svc.example.com"]
     assert svc["ips"] == ["10.0.0.5"]  # joined through the hostname
     assert svc["auth_verdict"] == "bearer"  # concrete scheme outranks none
-    # The evidence the scalars above were collapsed from: each URL's own verdict,
-    # its note if it carried one, and null fields omitted entirely.
+    # The evidence the scalars above were collapsed from: each URL's own verdict
+    # and status, with null fields omitted entirely.
     assert svc["urls"] == {
         "https://svc.example.com/": {
             "status_code": 200, "detected_method": "unauthenticated"},
         "https://svc.example.com/api": {
-            "status_code": 401, "detected_method": "bearer",
-            "note": "challenged at /api"},
+            "status_code": 401, "detected_method": "bearer"},
     }
     assert svc["mixed"] is True
     assert svc["urls_probed"] == 2
@@ -833,7 +831,7 @@ def test_write_results_services_urls_flag_synthesized_roots(tmp_path):
     auth_map = {
         "https://svc.example.com/api": _auth_info(
             "https://svc.example.com/api", AuthMethod.UNKNOWN, status=401,
-            note="host root discloses ntlm"),
+            root_discloses=AuthMethod.NTLM),
         "https://svc.example.com/": AuthInfo(
             url="https://svc.example.com/",
             probe_result=ProbeResult(
@@ -857,9 +855,12 @@ def test_write_results_services_urls_flag_synthesized_roots(tmp_path):
         "synthesized": True, "status_code": 401,
         "www_authenticate": "NTLM", "detected_method": "ntlm",
     }
-    # The referenced path keeps its own weaker verdict, unflagged.
+    # The referenced path keeps its own weaker verdict, unflagged — but carries
+    # `root_discloses`, the only thing tying it to the root entry above, which
+    # is a separate URL with no other link back to this one.
     assert "synthesized" not in svc["urls"]["https://svc.example.com/api"]
     assert svc["urls"]["https://svc.example.com/api"]["detected_method"] == "unknown"
+    assert svc["urls"]["https://svc.example.com/api"]["root_discloses"] == "ntlm"
     assert "auth" not in data
 
 
@@ -965,10 +966,10 @@ async def test_interaction_triggers_xhr(test_server):
 
 
 class TestParseWwwAuthenticate:
-    # Returns a bare AuthMethod — no note in any branch, because the caller keeps
-    # the raw header and it carries everything a note would have said. StrEnum
-    # members compare equal to their string value, so the bare-string asserts
-    # below double as a check on that contract.
+    # Returns a bare AuthMethod; the caller keeps the raw header beside it, which
+    # carries everything the verdict elides. StrEnum members compare equal to
+    # their string value, so the bare-string asserts below double as a check on
+    # that contract.
     def test_basic(self):
         assert _parse_www_authenticate('Basic realm="test"') == "basic"
 
@@ -994,52 +995,50 @@ class TestParseWwwAuthenticate:
 
 
 class TestClassifyProbe:
-    # _classify_probe returns (detected_method, note). detected_method is an
-    # auth verdict only; note carries the inconclusive/heads-up context.
+    # _classify_probe returns a bare AuthMethod verdict. StrEnum members compare
+    # equal to their string value, so the bare-string asserts below hold.
     def test_401_with_basic(self):
-        assert _classify_probe(401, 'Basic realm="x"') == ("basic", None)
+        assert _classify_probe(401, 'Basic realm="x"') == "basic"
 
-    def test_401_without_header_has_no_note(self):
-        # Bare 401 = auth required, scheme undisclosed. No note: the (401,
-        # unknown, no www_authenticate) triple is unique to this case.
-        assert _classify_probe(401, None) == ("unknown", None)
+    def test_401_without_header_is_unknown(self):
+        # Bare 401 = auth required, scheme undisclosed. It needs no marker of its
+        # own: the (401, unknown, no www_authenticate) triple is unique to it.
+        assert _classify_probe(401, None) == "unknown"
 
     def test_403_with_bearer_challenge(self):
         # RFC 6750 insufficient_scope: 403 carries a Bearer challenge, which
-        # must win over the bare unknown verdict a note-free 403 would get.
-        assert _classify_probe(403, 'Bearer error="insufficient_scope"') == ("bearer", None)
+        # must win over the bare unknown verdict a plain 403 would get.
+        assert _classify_probe(403, 'Bearer error="insufficient_scope"') == "bearer"
 
-    # The coarse 4xx statuses carry no note: status_code is emitted beside the
-    # verdict, so a note restating the status's reason phrase ("forbidden
-    # (403)") only duplicated it. Each still needs its own arm — falling through
-    # would mislabel them "unexpected status".
-    def test_403_without_header_has_no_note(self):
-        assert _classify_probe(403, None) == ("unknown", None)
+    # The coarse 4xx statuses all mean "we learned nothing about auth", and no
+    # longer have arms of their own — they fall through to the same UNKNOWN as
+    # everything unhandled. Each is still asserted, so the collapse can't quietly
+    # start reclassifying one of them.
+    def test_403_without_header_is_unknown(self):
+        assert _classify_probe(403, None) == "unknown"
 
-    def test_400_has_no_note(self):
-        assert _classify_probe(400, None) == ("unknown", None)
+    def test_400_is_unknown(self):
+        assert _classify_probe(400, None) == "unknown"
 
-    def test_404_has_no_note(self):
-        assert _classify_probe(404, None) == ("unknown", None)
+    def test_404_is_unknown(self):
+        assert _classify_probe(404, None) == "unknown"
 
-    def test_407_has_no_note(self):
-        assert _classify_probe(407, None) == ("unknown", None)
+    def test_407_is_unknown(self):
+        assert _classify_probe(407, None) == "unknown"
 
-    def test_5xx_note_carries_reason_phrase(self):
-        # The server's reason phrase rides along — 502/503/504 distinguish
-        # proxy/upstream topology from a plain 500.
-        assert _classify_probe(503, None, reason="Service Unavailable") == (
-            "unknown", "server error: 503 Service Unavailable")
-
-    def test_5xx_without_reason_phrase(self):
-        assert _classify_probe(500, None) == ("unknown", "server error: 500")
+    def test_5xx_is_unknown(self):
+        # A 5xx is a successful HTTP transaction that says nothing about auth.
+        # `status_code` is emitted beside the verdict, so a reader who needs to
+        # tell a 503 from a stale 404 still can.
+        assert _classify_probe(503, None) == "unknown"
+        assert _classify_probe(500, None) == "unknown"
 
     def test_200_with_header(self):
         # A challenge on any status is authoritative (RFC 7235 §4.1 MAY clause).
-        assert _classify_probe(200, "Negotiate") == ("negotiate", None)
+        assert _classify_probe(200, "Negotiate") == "negotiate"
 
     def test_200_without_header(self):
-        assert _classify_probe(200, None) == ("unauthenticated", None)
+        assert _classify_probe(200, None) == "unauthenticated"
 
     def test_3xx_offhost_with_keyword_is_oauth(self):
         # Redirect off-host to an IdP whose URL carries an auth keyword:
@@ -1048,7 +1047,7 @@ class TestClassifyProbe:
             302, None,
             "https://login.microsoftonline.com/authorize?client_id=x",
             "https://app.example.com/api",
-        ) == ("oauth", None)
+        ) == "oauth"
 
     def test_3xx_samehost_with_keyword_is_login_redirect(self):
         # Same-origin redirect to a login path is local form auth, not OAuth.
@@ -1056,37 +1055,37 @@ class TestClassifyProbe:
             302, None,
             "https://app.example.com/login",
             "https://app.example.com/dashboard",
-        ) == ("login_redirect", None)
+        ) == "login_redirect"
 
     def test_3xx_relative_location_with_keyword_is_login_redirect(self):
         # A relative "Location: /login" resolves to the same host once joined.
         assert _classify_probe(
             302, None, "/login", "https://app.example.com/dashboard",
-        ) == ("login_redirect", None)
+        ) == "login_redirect"
 
-    def test_3xx_offhost_without_keyword_has_no_note(self):
-        # Off-host redirect with no auth hint isn't an auth method, and gets no
-        # note either: off-origin can only fire on an absolute Location, so the
-        # host the note would name is already in ProbeResult.location.
+    def test_3xx_offhost_without_keyword_is_unknown(self):
+        # Off-host redirect with no auth hint isn't an auth method, and needs no
+        # marker either: off-origin can only fire on an absolute Location, so the
+        # host such a marker would name is already in ProbeResult.location.
         assert _classify_probe(
             302, None,
             "https://cdn.othercorp.com/assets",
             "https://app.example.com/static",
-        ) == ("unknown", None)
+        ) == "unknown"
 
-    def test_3xx_samehost_without_keyword_has_no_note(self):
-        # A plain same-origin route change needs no note: ProbeResult.location
-        # keeps the target verbatim, so the note would only repeat the record.
+    def test_3xx_samehost_without_keyword_is_unknown(self):
+        # A plain same-origin route change needs nothing more: ProbeResult.location
+        # keeps the target verbatim, so any gloss would only repeat the record.
         assert _classify_probe(
             302, None,
             "https://app.example.com/new-path",
             "https://app.example.com/old-path",
-        ) == ("unknown", None)
+        ) == "unknown"
 
-    def test_3xx_relative_location_without_keyword_has_no_note(self):
+    def test_3xx_relative_location_without_keyword_is_unknown(self):
         assert _classify_probe(
             302, None, "/new-path", "https://app.example.com/old-path",
-        ) == ("unknown", None)
+        ) == "unknown"
 
     def test_3xx_host_comparison_is_case_insensitive(self):
         # Differing host casing must not be mistaken for an off-host redirect.
@@ -1096,14 +1095,13 @@ class TestClassifyProbe:
             302, None,
             "https://APP.example.com/login",
             "https://app.example.com/old-path",
-        ) == ("login_redirect", None)
+        ) == "login_redirect"
 
-    def test_3xx_no_location_has_no_note(self):
-        # A redirect that named no target needs no note either: 3xx with no
+    def test_3xx_no_location_is_unknown(self):
+        # A redirect that named no target is legible as-is: 3xx with no
         # `location` in the record is that case and nothing else, since any
         # Location we did get is kept verbatim.
-        assert _classify_probe(302, None, "", "https://app.example.com/x") == (
-            "unknown", None)
+        assert _classify_probe(302, None, "", "https://app.example.com/x") == "unknown"
 
 
 # ===========================================================================
@@ -1121,7 +1119,7 @@ def _create_auth_app(gated_root: bool = False):
 
     gated_root makes `/` answer a Basic challenge instead of serving the index,
     so a second instance on another port is a *distinguishable* service sharing
-    one hostname — what the cross-origin breadcrumb test needs."""
+    one hostname — what the cross-origin root-disclosure test needs."""
     app = web.Application()
 
     async def handle_index(request):
@@ -1344,16 +1342,17 @@ async def test_probe_forbidden_keeps_verdict_and_probes_root(auth_server):
     assert root_probes[0].url == f"{auth_server}/"
     assert root_probes[0].status_code == 200
     assert root_probes[0].detected_method == "unauthenticated"
-    # breadcrumb links the locked path to the open front door. The 403 has no
-    # note of its own, so the breadcrumb is the whole note — no leading "; ".
-    assert path_probes[0].note == "host root is open (unauthenticated)"
+    # ...and the path is annotated with that root's verdict, the only thing
+    # linking the locked path to the open front door once the root is its own
+    # entry. UNAUTHENTICATED is how "front door open" is spelled.
+    assert path_probes[0].root_discloses == AuthMethod.UNAUTHENTICATED
 
 
 @pytest.mark.asyncio
-async def test_breadcrumb_does_not_cross_origins(auth_server, gated_auth_server):
+async def test_root_disclosure_does_not_cross_origins(auth_server, gated_auth_server):
     """Two ports on one hostname are two services, each with its own front door.
-    A gated path must get the breadcrumb from *its own* origin's root. Matching
-    the roots by bare hostname let whichever root was probed last explain every
+    A gated path must be annotated from *its own* origin's root. Matching the
+    roots by bare hostname let whichever root was probed last explain every
     gated path on the box — reporting an auth scheme for a service that was never
     probed that way, which is exactly the cross-origin merge _service_key exists
     to prevent in the report."""
@@ -1370,11 +1369,10 @@ async def test_breadcrumb_does_not_cross_origins(auth_server, gated_auth_server)
     # Both front doors were probed, as two separate services.
     assert {r.url for r in root_probes} == {f"{auth_server}/", f"{gated_auth_server}/"}
 
-    notes = {p.url: (p.note or "") for p in path_probes}
-    assert "host root is open" in notes[open_root]
-    assert "discloses basic" not in notes[open_root]        # the neighbour's verdict
-    assert "host root discloses basic" in notes[gated_root]
-    assert "is open" not in notes[gated_root]
+    # Each gated path carries its own origin's root verdict, not its neighbour's.
+    disclosed = {p.url: p.root_discloses for p in path_probes}
+    assert disclosed[open_root] == AuthMethod.UNAUTHENTICATED
+    assert disclosed[gated_root] == AuthMethod.BASIC
 
 
 @pytest.mark.asyncio
@@ -1405,11 +1403,11 @@ async def test_probe_unreachable_url():
 
 
 @pytest.mark.asyncio
-async def test_probe_bad_request_probes_root_no_breadcrumb(auth_server):
+async def test_probe_bad_request_probes_root_no_disclosure(auth_server):
     """400 (rejected before auth could be read) triggers a root probe so the
-    host's front door is still mapped — but gets NO breadcrumb, since "host root
-    discloses X" on a malformed-request path is an unfounded inference. The path
-    keeps its own verdict."""
+    host's front door is still mapped — but is never annotated with the root's
+    verdict, since "the root discloses X" on a malformed-request path is an
+    unfounded inference. The path keeps its own verdict."""
     path_probes, root_probes = await probe_urls_with_roots(
         [f"{auth_server}/auth/bad-request"], timeout=5.0)
     assert path_probes[0].status_code == 400
@@ -1419,8 +1417,8 @@ async def test_probe_bad_request_probes_root_no_breadcrumb(auth_server):
     assert len(root_probes) == 1
     assert root_probes[0].url.endswith("/")
     assert root_probes[0].detected_method == "unauthenticated"
-    # but no breadcrumb tying the 400 path to that root
-    assert "host root" not in (path_probes[0].note or "")
+    # but the 400 path is not annotated with that root's verdict
+    assert path_probes[0].root_discloses is None
 
 
 @pytest.mark.asyncio
@@ -1439,10 +1437,9 @@ async def test_probe_redirect(auth_server):
     assert len(results) == 1
     assert results[0].status_code == 301
     # A plain same-host redirect with no auth hint isn't an auth method — it's
-    # "unknown", and the target is the raw Location, not a note about it.
+    # "unknown", and the target is the raw Location, not a gloss on it.
     assert results[0].detected_method == "unknown"
     assert results[0].location == "/somewhere-else"
-    assert results[0].note is None
 
 
 @pytest.mark.asyncio
@@ -1474,10 +1471,9 @@ async def test_probe_server_error(auth_server):
     results = await probe_urls([f"{auth_server}/auth/server-error"], timeout=5.0)
     assert len(results) == 1
     assert results[0].status_code == 500
-    # 5xx is inconclusive for auth; the status (and reason phrase) ride in note.
+    # 5xx is inconclusive for auth. `status_code` is what tells it apart from a
+    # stale 404, and it is already in the record.
     assert results[0].detected_method == "unknown"
-    assert results[0].note is not None
-    assert "server error: 500" in results[0].note
 
 
 class TestHostRootUrl:
@@ -1523,17 +1519,17 @@ class TestServiceKey:
 
 
 @pytest.mark.asyncio
-async def test_probe_subpath_400_probes_root_no_breadcrumb(auth_server):
+async def test_probe_subpath_400_probes_root_no_disclosure(auth_server):
     """A 400 on a deep path triggers a probe of the host root (not the path's own
-    parent) so the front door is mapped; the path keeps its verdict and gets no
-    breadcrumb."""
+    parent) so the front door is mapped; the path keeps its verdict and is not
+    annotated with the root's."""
     path_probes, root_probes = await probe_urls_with_roots(
         [f"{auth_server}/api-gated/v1/data"], timeout=5.0)
     assert path_probes[0].status_code == 400
     assert path_probes[0].detected_method == "unknown"
     assert len(root_probes) == 1
     assert root_probes[0].url.endswith("/")
-    assert "host root" not in (path_probes[0].note or "")
+    assert path_probes[0].root_discloses is None
 
 
 @pytest.mark.asyncio

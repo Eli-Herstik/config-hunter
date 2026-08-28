@@ -69,17 +69,10 @@ class ProbeResult:
     # being a question. Often relative ("/login"); resolve against `url` for the
     # absolute target.
     location: str | None = None
-    # Short human-readable context, set only when it carries something none of
-    # the verdict, `status_code`, `www_authenticate` and `location` already does
-    # — e.g. "server error: 503 Service Unavailable" (the server's reason phrase,
-    # emitted nowhere else). None when the rest of the record already says
-    # everything: any verdict read off a WWW-Authenticate header (we keep the
-    # header, so it speaks for itself), UNAUTHENTICATED, a coarse 4xx
-    # (400/403/404/407) whose reason phrase the number conveys, or any redirect
-    # (`location` holds the target; a 3xx with no `location` named none).
-    # Distinct from `error`, which is reserved for transport failures (a 5xx is
-    # a successful HTTP transaction, so it lands here).
-    note: str | None = None
+    # The verdict this URL's *own* origin's root answered, so a gated path that 
+    # named no scheme still points at the front door that explains it.
+    # UNAUTHENTICATED means that front door is open.
+    root_discloses: AuthMethod | None = None
     error: str | None = None
 
 
@@ -136,7 +129,7 @@ def _service_key(url: str) -> str | None:
     Returns None if the URL has no host.
 
     Used both to roll auth verdicts up in the report and to scope the host-root
-    breadcrumb in probe_urls_with_roots — the two places one origin's evidence
+    disclosure in probe_urls_with_roots — the two places one origin's evidence
     must not leak onto another's."""
     parsed = urlparse(url)
     host = parsed.hostname
@@ -155,9 +148,9 @@ async def _do_probe_request(
     session: aiohttp.ClientSession,
     url: str,
     timeout: float,
-) -> tuple[int, str | None, str, str]:
+) -> tuple[int, str | None, str]:
     """Make a HEAD (or GET fallback) request.
-    Return (status_code, www_authenticate, location, reason_phrase)."""
+    Return (status_code, www_authenticate, location)."""
     async with session.head(url, timeout=aiohttp.ClientTimeout(total=timeout),
                             allow_redirects=False) as resp:
         status = resp.status
@@ -166,12 +159,10 @@ async def _do_probe_request(
                                    allow_redirects=False) as resp2:
                 return (resp2.status,
                         resp2.headers.get("WWW-Authenticate"),
-                        resp2.headers.get("Location", ""),
-                        resp2.reason or "")
+                        resp2.headers.get("Location", ""))
         return (status,
                 resp.headers.get("WWW-Authenticate"),
-                resp.headers.get("Location", ""),
-                resp.reason or "")
+                resp.headers.get("Location", ""))
 
 
 def _classify_redirect(location: str, url: str) -> AuthMethod:
@@ -199,36 +190,20 @@ def _classify_redirect(location: str, url: str) -> AuthMethod:
 
 
 def _classify_probe(status: int, www_auth: str | None, location: str = "",
-                    url: str = "", reason: str = "") -> tuple[AuthMethod, str | None]:
-    """Classify a probe response into (detected_method, note).
-
-    detected_method is an AuthMethod verdict; note is a short human-readable
-    string set only when it adds something the verdict, the status code and the
-    raw challenge and Location headers don't already carry (the server's reason
-    phrase on a 5xx or an unexpected status); it is None otherwise."""
+                    url: str = "") -> AuthMethod:
+    """Classify a probe response into an AuthMethod verdict."""
     # A WWW-Authenticate challenge is authoritative on any status, not just
     # 401. RFC 6750 (OAuth Bearer) returns it on 403 for insufficient_scope,
     # and the header MAY appear on other statuses per RFC 7235 §4.1.
     if www_auth:
-        return _parse_www_authenticate(www_auth), None
-    if status == 401:
-        # Auth is required and the scheme wasn't disclosed — but the record
-        # already says exactly that, and says it uniquely: status 401 with no
-        # `www_authenticate` key is the bare-challenge case and nothing else
-        # produces it (a named scheme sets detected_method; a tokenless header
-        # keeps the header).
-        return AuthMethod.UNKNOWN, None
-    if status in (400, 403, 404, 407):
-        return AuthMethod.UNKNOWN, None
+        return _parse_www_authenticate(www_auth)
     if 200 <= status < 300:
-        return AuthMethod.UNAUTHENTICATED, None
+        return AuthMethod.UNAUTHENTICATED
     if 300 <= status < 400:
-        return _classify_redirect(location, url), None
-    if 500 <= status < 600:
-        detail = f"{status} {reason}".strip()
-        return AuthMethod.UNKNOWN, f"server error: {detail}"
-    detail = f"{status} {reason}".strip()
-    return AuthMethod.UNKNOWN, f"unexpected status {detail}"
+        return _classify_redirect(location, url)
+    # Everything else — 401, the coarse 4xx (400/403/404/407), 5xx, and any
+    # status outside those ranges — tells us nothing about auth.
+    return AuthMethod.UNKNOWN
 
 
 def _classify_probe_error(exc: BaseException) -> str:
@@ -269,15 +244,13 @@ async def _probe_single(
     host-root enrichment is handled separately by probe_urls_with_roots."""
     async with semaphore:
         try:
-            status, www_auth, location, reason = await _do_probe_request(session, url, timeout)
-            method, note = _classify_probe(status, www_auth, location, url, reason)
+            status, www_auth, location = await _do_probe_request(session, url, timeout)
             return ProbeResult(
                 url=url,
                 status_code=status,
                 www_authenticate=www_auth,
-                detected_method=method,
+                detected_method=_classify_probe(status, www_auth, location, url),
                 location=location or None,
-                note=note,
             )
         except Exception as e:
             return ProbeResult(
@@ -320,13 +293,13 @@ async def probe_urls_with_roots(
     scheme not named) probe that host's root once to try to disclose the scheme.
 
     The root probe fires on three statuses but they mean different things:
-    401/403 establish "this path is gated, scheme undisclosed" — so we also drop
-    a breadcrumb linking the path to the front door that explains it. A 400
-    ("rejected before auth could be evaluated" — WAF, wrong verb/content-type,
-    SNI) establishes no such thing about the path, so it triggers the root probe
-    (the host is alive and its front door is a useful fact) but gets NO
-    breadcrumb — "host root discloses X" on a malformed-request path would be an
-    unfounded inference.
+    401/403 establish "this path is gated, scheme undisclosed" — so the root's
+    verdict is also recorded on the path as `root_discloses`, linking it to the
+    front door that explains it. A 400 ("rejected before auth could be
+    evaluated" — WAF, wrong verb/content-type, SNI) establishes no such thing
+    about the path, so it triggers the root probe (the host is alive and its
+    front door is a useful fact) but is never annotated — "the root discloses X"
+    on a malformed-request path would be an unfounded inference.
 
     Returns (path_probes, root_probes). root_probes are for synthesized
     host-root URLs not already in `urls`, filtered to those that disclosed
@@ -340,7 +313,7 @@ async def probe_urls_with_roots(
     def triggers_root(p: ProbeResult) -> bool:
         return p.status_code in (400, 401, 403) and p.detected_method is AuthMethod.UNKNOWN
 
-    def gets_breadcrumb(p: ProbeResult) -> bool:
+    def gets_root_disclosure(p: ProbeResult) -> bool:
         return p.status_code in (401, 403) and p.detected_method is AuthMethod.UNKNOWN
 
     probed = set(urls)
@@ -360,30 +333,25 @@ async def probe_urls_with_roots(
                        if r.detected_method is not None
                        and r.detected_method is not AuthMethod.UNKNOWN]
 
-    # Breadcrumb: point each undisclosed *gated* path (401/403) at the front door
-    # that explains it, since once the root is a separate entry nothing else links
-    # them in the per-URL view. 400 paths trigger the probe but get no breadcrumb.
+    # Point each undisclosed *gated* path (401/403) at the front door that
+    # explains it, since once the root is a separate entry nothing else links
+    # them in the per-URL view. 400 paths trigger the probe but are not annotated.
     #
     # Matched by _service_key (origin), not by hostname: the root we probed is
     # already origin-scoped (_host_root_url keeps scheme and port), so matching on
     # the bare hostname would let one origin's front door explain a path on a
     # different port or scheme of the same box — the cross-origin merge the report
     # is careful to avoid. Two ports on one host are two services with their own
-    # auth; "host root discloses ntlm" on the wrong one is a fabricated finding.
+    # auth; `root_discloses: ntlm` on the wrong one is a fabricated finding.
     disclosed: dict[str, AuthMethod] = {}
     for r in root_probes:
         svc = _service_key(r.url)
         if svc:
             disclosed[svc] = r.detected_method
     for p in path_probes:
-        if gets_breadcrumb(p):
+        if gets_root_disclosure(p):
             svc = _service_key(p.url)
-            m = disclosed.get(svc) if svc else None
-            if m is not None:
-                hint = ("host root is open (unauthenticated)"
-                        if m is AuthMethod.UNAUTHENTICATED
-                        else f"host root discloses {m.value}")
-                p.note = f"{p.note}; {hint}" if p.note else hint
+            p.root_discloses = disclosed.get(svc) if svc else None
     return path_probes, root_probes
 
 
@@ -1379,8 +1347,8 @@ def _url_evidence(info: "AuthInfo | None") -> dict:
         entry["location"] = p.location
     if p.detected_method is not None:
         entry["detected_method"] = p.detected_method
-    if p.note is not None:
-        entry["note"] = p.note
+    if p.root_discloses is not None:
+        entry["root_discloses"] = p.root_discloses
     if p.error is not None:
         entry["error"] = p.error
     return entry
