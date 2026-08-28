@@ -41,8 +41,8 @@ class AuthMethod(StrEnum):
     NEGOTIATE = "negotiate"
     NTLM = "ntlm"
     # An uncommon but well-formed challenge scheme (Digest, vendor schemes, ...).
-    # The specific scheme is named in ProbeResult.note; the raw header is also
-    # preserved in ProbeResult.www_authenticate.
+    # The specific scheme is the first token of ProbeResult.www_authenticate,
+    # which preserves the raw header.
     OTHER = "other"
     OAUTH = "oauth"
     LOGIN_REDIRECT = "login_redirect"
@@ -60,14 +60,15 @@ class ProbeResult:
     # OAUTH/LOGIN_REDIRECT/UNAUTHENTICATED/UNKNOWN). None only on transport
     # error (see `error`).
     detected_method: AuthMethod | None
-    # Short human-readable context, set only when it carries something neither
-    # the verdict nor `status_code` already does — e.g. "auth required, scheme
-    # undisclosed" (asserting the *absence* of a challenge header), "server
-    # error: 503 Service Unavailable" (the server's reason phrase, emitted
-    # nowhere else), "challenge scheme: digest" (naming an OTHER verdict),
-    # "redirects off-origin to sso.corp.local". None when the verdict and status
-    # already say everything: a named scheme, UNAUTHENTICATED, a clean redirect,
-    # or a coarse 4xx (400/403/404/407) whose reason phrase the number conveys.
+    # Short human-readable context, set only when it carries something none of
+    # the verdict, `status_code` and `www_authenticate` already does — e.g.
+    # "malformed WWW-Authenticate" (a header too broken to name a scheme),
+    # "server error: 503 Service Unavailable" (the server's reason phrase,
+    # emitted nowhere else), "redirects off-origin to sso.corp.local". None when
+    # the rest of the record already says everything: a named scheme,
+    # UNAUTHENTICATED, a clean redirect, an OTHER verdict (whose scheme is the
+    # first token of the header we kept), or a coarse 4xx (400/403/404/407)
+    # whose reason phrase the number conveys.
     # Distinct from `error`, which is reserved for transport failures (a 5xx is
     # a successful HTTP transaction, so it lands here).
     note: str | None = None
@@ -93,16 +94,17 @@ class AuthInfo:
 
 def _parse_www_authenticate(header: str) -> tuple[AuthMethod, str | None]:
     """Extract the auth scheme from a WWW-Authenticate header value, as
-    (method, note). A known challenge scheme maps to its AuthMethod with no
-    note; an unrecognized but well-formed scheme is OTHER with the scheme named
-    in the note; a truthy-but-tokenless header is UNKNOWN (a case the old
-    `scheme or "unknown"` swallowed silently)."""
+    (method, note). A known challenge scheme maps to its AuthMethod and an
+    unrecognized but well-formed one to OTHER — both with no note, since the
+    caller keeps the raw header in ProbeResult.www_authenticate and the scheme
+    is its first token. A truthy-but-tokenless header is UNKNOWN, noted as
+    malformed (a case the old `scheme or "unknown"` swallowed silently)."""
     scheme = header.strip().split()[0].lower() if header.strip() else ""
     known = {"basic", "bearer", "negotiate", "ntlm"}
     if scheme in known:
         return AuthMethod(scheme), None
     if scheme:
-        return AuthMethod.OTHER, f"challenge scheme: {scheme}"
+        return AuthMethod.OTHER, None
     return AuthMethod.UNKNOWN, "malformed WWW-Authenticate"
 
 
@@ -197,10 +199,10 @@ def _classify_probe(status: int, www_auth: str | None, location: str = "",
     """Classify a probe response into (detected_method, note).
 
     detected_method is an AuthMethod verdict; note is a short human-readable
-    string set only when it adds something the verdict and the status code don't
-    already carry (why we couldn't pin a method, an off-origin redirect target,
-    the server's reason phrase, or the specific scheme behind an OTHER verdict);
-    it is None otherwise."""
+    string set only when it adds something the verdict, the status code and the
+    raw challenge header don't already carry (why we couldn't pin a method, an
+    off-origin redirect target, the server's reason phrase); it is None
+    otherwise."""
     # A WWW-Authenticate challenge is authoritative on any status, not just
     # 401. RFC 6750 (OAuth Bearer) returns it on 403 for insufficient_scope,
     # and the header MAY appear on other statuses per RFC 7235 §4.1.
@@ -1307,11 +1309,11 @@ _VERDICT_PRECEDENCE: tuple[AuthMethod, ...] = (
     # Policy blocker, not a technical one — BASIC proxies fine. The objection is
     # that credentials ride every request, and exposure sends them outward.
     AuthMethod.BASIC,
-    # A named scheme we don't recognize (Digest, vendor schemes; the note says
-    # which). Ranked as a blocker by safe default — unrecognized means unsupported
-    # until someone confirms otherwise — not because any specific scheme is known
-    # to fail. Epistemically this is NEGOTIATE's tier; it sits above only because
-    # the safe assumption differs.
+    # A named scheme we don't recognize (Digest, vendor schemes; the URL's
+    # www_authenticate says which). Ranked as a blocker by safe default —
+    # unrecognized means unsupported until someone confirms otherwise — not
+    # because any specific scheme is known to fail. Epistemically this is
+    # NEGOTIATE's tier; it sits above only because the safe assumption differs.
     AuthMethod.OTHER,
     # --- Needs review: may or may not block; a human has to look. ---
     # Kerberos underneath is fine to expose; NTLM underneath is a blocker, and
