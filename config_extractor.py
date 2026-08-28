@@ -60,15 +60,26 @@ class ProbeResult:
     # OAUTH/LOGIN_REDIRECT/UNAUTHENTICATED/UNKNOWN). None only on transport
     # error (see `error`).
     detected_method: AuthMethod | None
+    # The response's Location header, verbatim (None when absent). Kept raw for
+    # the same reason `www_authenticate` is: the verdict is the summary, this is
+    # the evidence it was read off. It carries the most precisely where the
+    # verdict is most confident — OAUTH says a service federates, only the header
+    # says whether it federates to login.microsoftonline.com or to an ADFS box on
+    # this estate, and that is the difference between exposure being routine and
+    # being a question. Often relative ("/login"); resolve against `url` for the
+    # absolute target.
+    location: str | None = None
     # Short human-readable context, set only when it carries something none of
-    # the verdict, `status_code` and `www_authenticate` already does — e.g.
-    # "redirect (no Location header)",
-    # "server error: 503 Service Unavailable" (the server's reason phrase,
-    # emitted nowhere else), "redirects off-origin to sso.corp.local". None when
-    # the rest of the record already says everything: any verdict read off a
+    # the verdict, `status_code`, `www_authenticate` and `location` already does
+    # — e.g. "server error: 503 Service Unavailable" (the server's reason phrase,
+    # emitted nowhere else), "redirects off-origin to sso.corp.local" (a
+    # derived judgment: a relative Location doesn't show it). None when the rest
+    # of the record already says everything: any verdict read off a
     # WWW-Authenticate header (we keep the header, so it speaks for itself),
-    # UNAUTHENTICATED, a clean redirect, or a coarse 4xx (400/403/404/407) whose
-    # reason phrase the number conveys.
+    # UNAUTHENTICATED, a coarse 4xx (400/403/404/407) whose reason phrase the
+    # number conveys, or any redirect that stays on this origin — whether we
+    # kept its Location or it sent none, both of which the record shows on its
+    # own (see _classify_redirect).
     # Distinct from `error`, which is reserved for transport failures (a 5xx is
     # a successful HTTP transaction, so it lands here).
     note: str | None = None
@@ -169,11 +180,13 @@ async def _do_probe_request(
 def _classify_redirect(location: str, url: str) -> tuple[AuthMethod, str | None]:
     """Sub-classify a 3xx response into (detected_method, note).
 
-    An auth-flagged redirect is a real auth verdict (OAUTH / LOGIN_REDIRECT);
-    a plain route change is not a method, so it returns UNKNOWN with a note
-    describing where it points."""
+    An auth-flagged redirect is a real auth verdict (OAUTH / LOGIN_REDIRECT); a
+    plain route change is not a method, so it returns UNKNOWN — and notes only
+    the one thing ProbeResult.location can't show for itself, that the target
+    left this origin."""
     if not location:
-        return AuthMethod.UNKNOWN, "redirect (no Location header)"
+        # A redirect that named no target.
+        return AuthMethod.UNKNOWN, None
     has_keyword = any(kw in location.lower()
                       for kw in ("oauth", "authorize", "login", "auth"))
     # Compare the redirect target's host to the probed host. A federated
@@ -189,7 +202,11 @@ def _classify_redirect(location: str, url: str) -> tuple[AuthMethod, str | None]
         return (AuthMethod.OAUTH, None) if off_host else (AuthMethod.LOGIN_REDIRECT, None)
     if off_host:
         return AuthMethod.UNKNOWN, f"redirects off-origin to {target_host}"
-    return AuthMethod.UNKNOWN, f"redirects to {target}"
+    # Same-origin route change, and no note: `location` holds the target
+    # verbatim, so "3xx with a Location that stays on this origin" is already
+    # legible in the record. (The off-host branch above still notes, because
+    # off-origin-ness is a derived comparison the raw header doesn't show.)
+    return AuthMethod.UNKNOWN, None
 
 
 def _classify_probe(status: int, www_auth: str | None, location: str = "",
@@ -198,9 +215,8 @@ def _classify_probe(status: int, www_auth: str | None, location: str = "",
 
     detected_method is an AuthMethod verdict; note is a short human-readable
     string set only when it adds something the verdict, the status code and the
-    raw challenge header don't already carry (why we couldn't pin a method, an
-    off-origin redirect target, the server's reason phrase); it is None
-    otherwise."""
+    raw challenge and Location headers don't already carry (an off-origin
+    redirect target, the server's reason phrase); it is None otherwise."""
     # A WWW-Authenticate challenge is authoritative on any status, not just
     # 401. RFC 6750 (OAuth Bearer) returns it on 403 for insufficient_scope,
     # and the header MAY appear on other statuses per RFC 7235 §4.1.
@@ -271,6 +287,9 @@ async def _probe_single(
                 status_code=status,
                 www_authenticate=www_auth,
                 detected_method=method,
+                # "" (header absent) normalizes to None, so absent is spelled
+                # the same way here as it is for www_authenticate.
+                location=location or None,
                 note=note,
             )
         except Exception as e:
@@ -1351,7 +1370,7 @@ def _url_evidence(info: "AuthInfo | None") -> dict:
     """Render one URL's probe evidence as emitted under a service's `urls`.
 
     Null fields are omitted rather than serialized: most probes set two or three
-    of the five, and spelling out the nulls cost more bytes than the evidence.
+    of the six, and spelling out the nulls cost more bytes than the evidence.
     An empty dict is therefore a real answer — "discovered, never probed" — not a
     missing one. `synthesized` marks a host root the scanner probed on its own
     initiative (see AuthInfo.synthesized): it is listed among the service's URLs
@@ -1369,6 +1388,8 @@ def _url_evidence(info: "AuthInfo | None") -> dict:
         entry["status_code"] = p.status_code
     if p.www_authenticate is not None:
         entry["www_authenticate"] = p.www_authenticate
+    if p.location is not None:
+        entry["location"] = p.location
     if p.detected_method is not None:
         entry["detected_method"] = p.detected_method
     if p.note is not None:

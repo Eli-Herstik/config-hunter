@@ -863,6 +863,34 @@ def test_write_results_services_urls_flag_synthesized_roots(tmp_path):
     assert "auth" not in data
 
 
+def test_write_results_urls_carry_redirect_location(tmp_path):
+    """A redirect's Location is emitted as the evidence behind the verdict:
+    `oauth` says a service federates, the header says to whom."""
+    sources = [ConfigSource(
+        origin="js: https://app/bundle.js",
+        urls_found=["https://svc.example.com/api"],
+    )]
+    auth_map = {
+        "https://svc.example.com/api": AuthInfo(
+            url="https://svc.example.com/api",
+            probe_result=ProbeResult(
+                url="https://svc.example.com/api", status_code=302,
+                www_authenticate=None, detected_method=AuthMethod.OAUTH,
+                location="https://sso.corp.local/oauth2/authorize?client_id=x"),
+        ),
+    }
+    out = tmp_path / "r.json"
+    write_results(sources, str(out), auth_map, [], {"svc.example.com": ["10.0.0.5"]})
+    with open(out, "r", encoding="utf-8") as f:
+        data = json.load(f)
+
+    assert data["services"]["https://svc.example.com"]["urls"][
+        "https://svc.example.com/api"] == {
+        "status_code": 302, "detected_method": "oauth",
+        "location": "https://sso.corp.local/oauth2/authorize?client_id=x",
+    }
+
+
 @pytest.mark.asyncio
 async def test_default_single_url_unchanged(test_server):
     """Without follow_links, the deep route and the cookie-gated API must NOT appear."""
@@ -1045,34 +1073,35 @@ class TestClassifyProbe:
             "https://app.example.com/static",
         ) == ("unknown", "redirects off-origin to cdn.othercorp.com")
 
-    def test_3xx_samehost_without_keyword_notes_redirect(self):
-        method, note = _classify_probe(
+    def test_3xx_samehost_without_keyword_has_no_note(self):
+        # A plain same-origin route change needs no note: ProbeResult.location
+        # keeps the target verbatim, so the note would only repeat the record.
+        assert _classify_probe(
             302, None,
             "https://app.example.com/new-path",
             "https://app.example.com/old-path",
-        )
-        assert method == "unknown"
-        assert note == "redirects to https://app.example.com/new-path"
-        assert "off-origin" not in note
+        ) == ("unknown", None)
 
-    def test_3xx_relative_location_without_keyword_notes_redirect(self):
+    def test_3xx_relative_location_without_keyword_has_no_note(self):
         assert _classify_probe(
             302, None, "/new-path", "https://app.example.com/old-path",
-        ) == ("unknown", "redirects to https://app.example.com/new-path")
+        ) == ("unknown", None)
 
     def test_3xx_host_comparison_is_case_insensitive(self):
-        # Differing host casing must not be mistaken for an off-host redirect.
-        method, note = _classify_probe(
+        # Differing host casing must not be mistaken for an off-host redirect —
+        # which would show up as an "off-origin" note where same-origin has none.
+        assert _classify_probe(
             302, None,
             "https://APP.example.com/new-path",
             "https://app.example.com/old-path",
-        )
-        assert method == "unknown"
-        assert "off-origin" not in note
+        ) == ("unknown", None)
 
-    def test_3xx_no_location_is_a_note(self):
+    def test_3xx_no_location_has_no_note(self):
+        # A redirect that named no target needs no note either: 3xx with no
+        # `location` in the record is that case and nothing else, since any
+        # Location we did get is kept verbatim.
         assert _classify_probe(302, None, "", "https://app.example.com/x") == (
-            "unknown", "redirect (no Location header)")
+            "unknown", None)
 
 
 # ===========================================================================
@@ -1279,6 +1308,8 @@ async def test_probe_basic_auth(auth_server):
     assert results[0].status_code == 401
     assert results[0].detected_method == "basic"
     assert results[0].www_authenticate is not None
+    # No Location on a non-redirect: absent is None, not "".
+    assert results[0].location is None
 
 
 @pytest.mark.asyncio
@@ -1405,10 +1436,11 @@ async def test_probe_redirect(auth_server):
     results = await probe_urls([f"{auth_server}/auth/redirect"], timeout=5.0)
     assert len(results) == 1
     assert results[0].status_code == 301
-    # A plain same-host redirect with no auth hint isn't an auth method —
-    # it's "unknown" with the target recorded in the note.
+    # A plain same-host redirect with no auth hint isn't an auth method — it's
+    # "unknown", and the target is the raw Location, not a note about it.
     assert results[0].detected_method == "unknown"
-    assert "redirects to" in results[0].note
+    assert results[0].location == "/somewhere-else"
+    assert results[0].note is None
 
 
 @pytest.mark.asyncio
@@ -1418,6 +1450,8 @@ async def test_probe_redirect_to_login(auth_server):
     assert len(results) == 1
     assert results[0].status_code == 302
     assert results[0].detected_method == "login_redirect"
+    # The verdict says "local form auth"; only the header says which door.
+    assert results[0].location == "/oauth/authorize?client_id=abc"
 
 
 @pytest.mark.asyncio
@@ -1427,6 +1461,10 @@ async def test_probe_redirect_to_idp(auth_server):
     assert len(results) == 1
     assert results[0].status_code == 302
     assert results[0].detected_method == "oauth"
+    # The point of keeping the header: "oauth" alone can't tell an external IdP
+    # from an ADFS box on the estate, and that difference decides the exposure.
+    assert results[0].location == (
+        "https://login.microsoftonline.com/authorize?client_id=abc")
 
 
 @pytest.mark.asyncio
