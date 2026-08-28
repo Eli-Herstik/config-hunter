@@ -262,6 +262,26 @@ async def _probe_single(
             )
 
 
+def _probe_ssl_context() -> ssl.SSLContext:
+    """Build the TLS context used for probing, deliberately WITHOUT ALPN.
+
+    aiohttp's default context calls set_alpn_protocols(("http/1.1",)), which
+    advertises "I explicitly decline HTTP/2" in the ClientHello. Every real
+    browser offers ("h2", "http/1.1"), so http/1.1-only reads as a bot
+    fingerprint and CDN/WAF tiers reject the handshake's request outright --
+    Fastly (Unsplash) answers 403 with an empty body, `Retry-After: 0` and a
+    single `Via`, i.e. an edge synthetic that never reached the origin. That
+    403 is indistinguishable from a real "this path is gated" and silently
+    poisons the auth verdict, which matters most on the internal estate this
+    tool is pointed at: F5 ASM fingerprints clients the same way.
+
+    Offering no ALPN at all sidesteps the rule -- servers then fall back to
+    HTTP/1.1, which is the only protocol aiohttp speaks. Do NOT offer "h2"
+    here: the server would negotiate HTTP/2 and aiohttp would write HTTP/1.1
+    bytes into an h2 connection."""
+    return ssl.create_default_context()
+
+
 async def probe_urls(
     urls: list[str],
     timeout: float = 5.0,
@@ -273,7 +293,10 @@ async def probe_urls(
     unique_urls = list(dict.fromkeys(urls))  # deduplicate, preserve order
     semaphore = asyncio.Semaphore(max_concurrent)
     merged_headers = {"User-Agent": "ConfigExtractor/1.0", **(headers or {})}
-    session_kwargs: dict = {"headers": merged_headers}
+    session_kwargs: dict = {
+        "headers": merged_headers,
+        "connector": aiohttp.TCPConnector(ssl=_probe_ssl_context()),
+    }
     if cookies:
         session_kwargs["cookies"] = cookies
     async with aiohttp.ClientSession(**session_kwargs) as session:
