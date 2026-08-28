@@ -62,13 +62,13 @@ class ProbeResult:
     detected_method: AuthMethod | None
     # Short human-readable context, set only when it carries something none of
     # the verdict, `status_code` and `www_authenticate` already does — e.g.
-    # "malformed WWW-Authenticate" (a header too broken to name a scheme),
+    # "redirect (no Location header)",
     # "server error: 503 Service Unavailable" (the server's reason phrase,
     # emitted nowhere else), "redirects off-origin to sso.corp.local". None when
-    # the rest of the record already says everything: a named scheme,
-    # UNAUTHENTICATED, a clean redirect, an OTHER verdict (whose scheme is the
-    # first token of the header we kept), or a coarse 4xx (400/403/404/407)
-    # whose reason phrase the number conveys.
+    # the rest of the record already says everything: any verdict read off a
+    # WWW-Authenticate header (we keep the header, so it speaks for itself),
+    # UNAUTHENTICATED, a clean redirect, or a coarse 4xx (400/403/404/407) whose
+    # reason phrase the number conveys.
     # Distinct from `error`, which is reserved for transport failures (a 5xx is
     # a successful HTTP transaction, so it lands here).
     note: str | None = None
@@ -92,20 +92,18 @@ class AuthInfo:
 # HTTP probing
 # ---------------------------------------------------------------------------
 
-def _parse_www_authenticate(header: str) -> tuple[AuthMethod, str | None]:
-    """Extract the auth scheme from a WWW-Authenticate header value, as
-    (method, note). A known challenge scheme maps to its AuthMethod and an
-    unrecognized but well-formed one to OTHER — both with no note, since the
-    caller keeps the raw header in ProbeResult.www_authenticate and the scheme
-    is its first token. A truthy-but-tokenless header is UNKNOWN, noted as
-    malformed (a case the old `scheme or "unknown"` swallowed silently)."""
+def _parse_www_authenticate(header: str) -> AuthMethod:
+    """Extract the auth scheme from a WWW-Authenticate header value.
+
+    A known challenge scheme maps to its AuthMethod, an unrecognized but
+    well-formed one to OTHER, and a truthy-but-tokenless header to UNKNOWN."""
     scheme = header.strip().split()[0].lower() if header.strip() else ""
     known = {"basic", "bearer", "negotiate", "ntlm"}
     if scheme in known:
-        return AuthMethod(scheme), None
+        return AuthMethod(scheme)
     if scheme:
-        return AuthMethod.OTHER, None
-    return AuthMethod.UNKNOWN, "malformed WWW-Authenticate"
+        return AuthMethod.OTHER
+    return AuthMethod.UNKNOWN
 
 
 def _host_root_url(url: str) -> str | None:
@@ -207,13 +205,13 @@ def _classify_probe(status: int, www_auth: str | None, location: str = "",
     # 401. RFC 6750 (OAuth Bearer) returns it on 403 for insufficient_scope,
     # and the header MAY appear on other statuses per RFC 7235 §4.1.
     if www_auth:
-        return _parse_www_authenticate(www_auth)
+        return _parse_www_authenticate(www_auth), None
     if status == 401:
         # Auth is required and the scheme wasn't disclosed — but the record
         # already says exactly that, and says it uniquely: status 401 with no
         # `www_authenticate` key is the bare-challenge case and nothing else
         # produces it (a named scheme sets detected_method; a tokenless header
-        # keeps the header and notes "malformed").
+        # keeps the header).
         return AuthMethod.UNKNOWN, None
     if status in (400, 403, 404, 407):
         return AuthMethod.UNKNOWN, None
