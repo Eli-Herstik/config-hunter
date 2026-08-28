@@ -72,14 +72,11 @@ class ProbeResult:
     # Short human-readable context, set only when it carries something none of
     # the verdict, `status_code`, `www_authenticate` and `location` already does
     # — e.g. "server error: 503 Service Unavailable" (the server's reason phrase,
-    # emitted nowhere else), "redirects off-origin to sso.corp.local" (a
-    # derived judgment: a relative Location doesn't show it). None when the rest
-    # of the record already says everything: any verdict read off a
-    # WWW-Authenticate header (we keep the header, so it speaks for itself),
-    # UNAUTHENTICATED, a coarse 4xx (400/403/404/407) whose reason phrase the
-    # number conveys, or any redirect that stays on this origin — whether we
-    # kept its Location or it sent none, both of which the record shows on its
-    # own (see _classify_redirect).
+    # emitted nowhere else). None when the rest of the record already says
+    # everything: any verdict read off a WWW-Authenticate header (we keep the
+    # header, so it speaks for itself), UNAUTHENTICATED, a coarse 4xx
+    # (400/403/404/407) whose reason phrase the number conveys, or any redirect
+    # (`location` holds the target; a 3xx with no `location` named none).
     # Distinct from `error`, which is reserved for transport failures (a 5xx is
     # a successful HTTP transaction, so it lands here).
     note: str | None = None
@@ -177,16 +174,14 @@ async def _do_probe_request(
                 resp.reason or "")
 
 
-def _classify_redirect(location: str, url: str) -> tuple[AuthMethod, str | None]:
-    """Sub-classify a 3xx response into (detected_method, note).
+def _classify_redirect(location: str, url: str) -> AuthMethod:
+    """Sub-classify a 3xx response into a detected_method.
 
     An auth-flagged redirect is a real auth verdict (OAUTH / LOGIN_REDIRECT); a
-    plain route change is not a method, so it returns UNKNOWN — and notes only
-    the one thing ProbeResult.location can't show for itself, that the target
-    left this origin."""
+    plain route change is not a method, so it is UNKNOWN.
+    ProbeResult.location keeps the target verbatim."""
     if not location:
-        # A redirect that named no target.
-        return AuthMethod.UNKNOWN, None
+        return AuthMethod.UNKNOWN
     has_keyword = any(kw in location.lower()
                       for kw in ("oauth", "authorize", "login", "auth"))
     # Compare the redirect target's host to the probed host. A federated
@@ -199,14 +194,8 @@ def _classify_redirect(location: str, url: str) -> tuple[AuthMethod, str | None]
     probed_host = (urlparse(url).hostname or "").lower()
     off_host = bool(target_host) and target_host != probed_host
     if has_keyword:
-        return (AuthMethod.OAUTH, None) if off_host else (AuthMethod.LOGIN_REDIRECT, None)
-    if off_host:
-        return AuthMethod.UNKNOWN, f"redirects off-origin to {target_host}"
-    # Same-origin route change, and no note: `location` holds the target
-    # verbatim, so "3xx with a Location that stays on this origin" is already
-    # legible in the record. (The off-host branch above still notes, because
-    # off-origin-ness is a derived comparison the raw header doesn't show.)
-    return AuthMethod.UNKNOWN, None
+        return AuthMethod.OAUTH if off_host else AuthMethod.LOGIN_REDIRECT
+    return AuthMethod.UNKNOWN
 
 
 def _classify_probe(status: int, www_auth: str | None, location: str = "",
@@ -215,8 +204,8 @@ def _classify_probe(status: int, www_auth: str | None, location: str = "",
 
     detected_method is an AuthMethod verdict; note is a short human-readable
     string set only when it adds something the verdict, the status code and the
-    raw challenge and Location headers don't already carry (an off-origin
-    redirect target, the server's reason phrase); it is None otherwise."""
+    raw challenge and Location headers don't already carry (the server's reason
+    phrase on a 5xx or an unexpected status); it is None otherwise."""
     # A WWW-Authenticate challenge is authoritative on any status, not just
     # 401. RFC 6750 (OAuth Bearer) returns it on 403 for insufficient_scope,
     # and the header MAY appear on other statuses per RFC 7235 §4.1.
@@ -234,7 +223,7 @@ def _classify_probe(status: int, www_auth: str | None, location: str = "",
     if 200 <= status < 300:
         return AuthMethod.UNAUTHENTICATED, None
     if 300 <= status < 400:
-        return _classify_redirect(location, url)
+        return _classify_redirect(location, url), None
     if 500 <= status < 600:
         detail = f"{status} {reason}".strip()
         return AuthMethod.UNKNOWN, f"server error: {detail}"
@@ -287,8 +276,6 @@ async def _probe_single(
                 status_code=status,
                 www_authenticate=www_auth,
                 detected_method=method,
-                # "" (header absent) normalizes to None, so absent is spelled
-                # the same way here as it is for www_authenticate.
                 location=location or None,
                 note=note,
             )

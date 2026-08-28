@@ -1064,14 +1064,15 @@ class TestClassifyProbe:
             302, None, "/login", "https://app.example.com/dashboard",
         ) == ("login_redirect", None)
 
-    def test_3xx_offhost_without_keyword_notes_off_origin(self):
-        # Off-host redirect with no auth hint isn't an auth method, but the
-        # cross-origin dependency is worth flagging in the note.
+    def test_3xx_offhost_without_keyword_has_no_note(self):
+        # Off-host redirect with no auth hint isn't an auth method, and gets no
+        # note either: off-origin can only fire on an absolute Location, so the
+        # host the note would name is already in ProbeResult.location.
         assert _classify_probe(
             302, None,
             "https://cdn.othercorp.com/assets",
             "https://app.example.com/static",
-        ) == ("unknown", "redirects off-origin to cdn.othercorp.com")
+        ) == ("unknown", None)
 
     def test_3xx_samehost_without_keyword_has_no_note(self):
         # A plain same-origin route change needs no note: ProbeResult.location
@@ -1088,13 +1089,14 @@ class TestClassifyProbe:
         ) == ("unknown", None)
 
     def test_3xx_host_comparison_is_case_insensitive(self):
-        # Differing host casing must not be mistaken for an off-host redirect —
-        # which would show up as an "off-origin" note where same-origin has none.
+        # Differing host casing must not be mistaken for an off-host redirect.
+        # Checked through a login target, where the comparison is observable:
+        # same-origin is a local form login, off-origin would be federated OAuth.
         assert _classify_probe(
             302, None,
-            "https://APP.example.com/new-path",
+            "https://APP.example.com/login",
             "https://app.example.com/old-path",
-        ) == ("unknown", None)
+        ) == ("login_redirect", None)
 
     def test_3xx_no_location_has_no_note(self):
         # A redirect that named no target needs no note either: 3xx with no
