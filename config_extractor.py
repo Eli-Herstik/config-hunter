@@ -41,8 +41,8 @@ class AuthMethod(StrEnum):
     NEGOTIATE = "negotiate"
     NTLM = "ntlm"
     # An uncommon but well-formed challenge scheme (Digest, vendor schemes, ...).
-    # The specific scheme is the first token of ProbeResult.www_authenticate,
-    # which preserves the raw header.
+    # Which one is in ProbeResult.www_authenticate, which preserves the raw
+    # header — every challenge of it, when the response offered several.
     OTHER = "other"
     OAUTH = "oauth"
     LOGIN_REDIRECT = "login_redirect"
@@ -50,11 +50,63 @@ class AuthMethod(StrEnum):
     UNKNOWN = "unknown"
 
 
+# Risk ranking over the auth verdicts; earlier wins. The sort is by *blocker
+# risk*, not by informativeness: the question this report answers is "can this
+# service go behind the F5, and if not, why not", so the answer is the worst
+# thing found. Two consumers ask that question of different sets, and neither
+# changes how a single response is probed: _collapse_host_verdict, over the
+# verdicts of a service's URLs when they disagreed (see `mixed`), and
+# _parse_www_authenticate, over the schemes of one response that offered several
+# challenges at once. Transport errors (detected_method is None) are not auth
+# verdicts — they're counted as `unreachable`, not ranked.
+_VERDICT_PRECEDENCE: tuple[AuthMethod, ...] = (
+    # --- Blockers: exposure can't proceed as-is. ---
+    # Technical blocker. NTLM authenticates the TCP connection, not the request,
+    # so connection reuse/multiplexing at the proxy breaks the handshake.
+    AuthMethod.NTLM,
+    # Policy blocker, not a technical one — BASIC proxies fine. The objection is
+    # that credentials ride every request, and exposure sends them outward.
+    AuthMethod.BASIC,
+    # A named scheme we don't recognize (Digest, vendor schemes; the URL's
+    # www_authenticate says which). Ranked as a blocker by safe default —
+    # unrecognized means unsupported until someone confirms otherwise — not
+    # because any specific scheme is known to fail. Epistemically this is
+    # NEGOTIATE's tier; it sits above only because the safe assumption differs.
+    AuthMethod.OTHER,
+    # --- Needs review: may or may not block; a human has to look. ---
+    # Kerberos underneath is fine to expose; NTLM underneath is a blocker, and
+    # the challenge alone doesn't say which.
+    AuthMethod.NEGOTIATE,
+    # --- Exposable: concrete and known-good. ---
+    AuthMethod.BEARER,
+    AuthMethod.OAUTH,
+    AuthMethod.LOGIN_REDIRECT,
+    # UNKNOWN stays below the concrete verdicts and above UNAUTHENTICATED. By the
+    # NEGOTIATE argument it belongs in the review tier — a 401/403 with no
+    # WWW-Authenticate could be hiding NTLM. But UNKNOWN is a catch-all that also
+    # absorbs 404/400/5xx/407 and plain non-auth redirects, and stale URLs
+    # harvested from JS bundles 404 constantly, so promoting the whole bucket
+    # would flag most services for review on the strength of one dead path.
+    # Splitting out a distinct "gated, scheme undisclosed" verdict (401/403) is
+    # what would earn a spot next to NEGOTIATE.
+    # It still outranks UNAUTHENTICATED: if open won, one open endpoint (often the
+    # host root) would mask a restricted sibling in the headline — the false
+    # negative this scan exists to catch.
+    AuthMethod.UNKNOWN,
+    AuthMethod.UNAUTHENTICATED,
+)
+
+
 @dataclass
 class ProbeResult:
     """Auth evidence from HTTP probing."""
     url: str
     status_code: int | None
+    # The response's WWW-Authenticate challenge(s), verbatim (None when absent).
+    # A response may offer several at once, as repeated header lines or as one
+    # comma-separated value; RFC 9110 §5.3 makes those forms equivalent and
+    # _joined_www_authenticate normalizes both to the second, so this holds all
+    # of them — not just the one `detected_method` was drawn from.
     www_authenticate: str | None
     # Auth verdict, an AuthMethod (one of BASIC/BEARER/NEGOTIATE/NTLM/OTHER/
     # OAUTH/LOGIN_REDIRECT/UNAUTHENTICATED/UNKNOWN). None only on transport
@@ -93,17 +145,77 @@ class AuthInfo:
 # HTTP probing
 # ---------------------------------------------------------------------------
 
+# RFC 9110 tchar — the characters legal in a scheme name or an auth-param name.
+_TCHAR = r"!#$%&'*+\-.^_`|~0-9A-Za-z"
+# A comma-piece shaped `token=` is an auth-param continuing the challenge before
+# it, not a new challenge. BWS around the `=` is legal, hence the \s*.
+_AUTH_PARAM_RE = re.compile(rf"^[{_TCHAR}]+\s*=")
+
+_KNOWN_SCHEMES = {"basic", "bearer", "negotiate", "ntlm"}
+
+
+def _split_unquoted_commas(value: str) -> list[str]:
+    """Split on the commas that sit outside a quoted-string.
+
+    An auth-param value may contain a comma of its own (realm="a,b"), which a
+    plain str.split(",") would tear in half."""
+    pieces: list[str] = []
+    current: list[str] = []
+    in_quotes = False
+    escaped = False
+    for ch in value:
+        if escaped:
+            escaped = False
+        elif ch == "\\" and in_quotes:
+            escaped = True
+        elif ch == '"':
+            in_quotes = not in_quotes
+        elif ch == "," and not in_quotes:
+            pieces.append("".join(current))
+            current = []
+            continue
+        current.append(ch)
+    pieces.append("".join(current))
+    return pieces
+
+
+def _challenge_schemes(header: str) -> list[str]:
+    """Return the lowercased scheme name of every challenge in a header value.
+
+    One value can carry several challenges — and the auth-params *inside* a
+    single challenge are comma-separated too, so the pieces have to be told
+    apart rather than merely split: `Digest realm="x", qop="auth"` is one
+    challenge, `Negotiate, NTLM` is two. A piece shaped `token=` is a param;
+    anything else opens a challenge whose first token names the scheme."""
+    schemes: list[str] = []
+    for piece in _split_unquoted_commas(header):
+        piece = piece.strip()
+        if not piece or _AUTH_PARAM_RE.match(piece):
+            continue
+        schemes.append(piece.split()[0].lower())
+    return schemes
+
+
 def _parse_www_authenticate(header: str) -> AuthMethod:
-    """Extract the auth scheme from a WWW-Authenticate header value.
+    """Reduce a WWW-Authenticate header value to one AuthMethod verdict.
 
     A known challenge scheme maps to its AuthMethod, an unrecognized but
-    well-formed one to OTHER, and a truthy-but-tokenless header to UNKNOWN."""
-    scheme = header.strip().split()[0].lower() if header.strip() else ""
-    known = {"basic", "bearer", "negotiate", "ntlm"}
-    if scheme in known:
-        return AuthMethod(scheme)
-    if scheme:
-        return AuthMethod.OTHER
+    well-formed one to OTHER, and a header that names no scheme at all — empty,
+    whitespace, or nothing but auth-params — to UNKNOWN.
+
+    A server may offer several schemes at once, and on this estate the common
+    case is IIS's `Negotiate` ahead of `NTLM`. Every offer is real: the client
+    picks, so the F5 has to survive whichever it picks. The verdict is therefore
+    the highest-risk scheme on offer, by _VERDICT_PRECEDENCE — reading the first
+    one instead would let the server's header order decide whether the NTLM
+    behind a leading `Negotiate` ever reaches the report."""
+    offered = {
+        AuthMethod(s) if s in _KNOWN_SCHEMES else AuthMethod.OTHER
+        for s in _challenge_schemes(header)
+    }
+    for method in _VERDICT_PRECEDENCE:
+        if method in offered:
+            return method
     return AuthMethod.UNKNOWN
 
 
@@ -144,6 +256,21 @@ def _service_key(url: str) -> str | None:
     return f"{parsed.scheme}://{host}"
 
 
+def _joined_www_authenticate(resp: aiohttp.ClientResponse) -> str | None:
+    """Return every WWW-Authenticate line of a response, joined into one value,
+    or None if it sent none.
+
+    A server offering several schemes may repeat the header instead of
+    comma-separating one value — IIS sends `Negotiate` and `NTLM` on their own
+    lines. aiohttp keeps repeats as separate multidict entries and .get() hands
+    back only the first, which would drop the rest from the verdict *and* from
+    the evidence field that exists to be read by a human. RFC 9110 §5.3 makes
+    the comma-joined form equivalent, so joining loses nothing and leaves
+    _parse_www_authenticate one shape to read instead of two."""
+    values = resp.headers.getall("WWW-Authenticate", ())
+    return ", ".join(values) if values else None
+
+
 async def _do_probe_request(
     session: aiohttp.ClientSession,
     url: str,
@@ -158,10 +285,10 @@ async def _do_probe_request(
             async with session.get(url, timeout=aiohttp.ClientTimeout(total=timeout),
                                    allow_redirects=False) as resp2:
                 return (resp2.status,
-                        resp2.headers.get("WWW-Authenticate"),
+                        _joined_www_authenticate(resp2),
                         resp2.headers.get("Location", ""))
         return (status,
-                resp.headers.get("WWW-Authenticate"),
+                _joined_www_authenticate(resp),
                 resp.headers.get("Location", ""))
 
 
@@ -1287,51 +1414,6 @@ async def crawl(
 # ---------------------------------------------------------------------------
 # Reporting
 # ---------------------------------------------------------------------------
-
-# Precedence for collapsing a service's per-URL auth verdicts into one headline
-# method. Earlier wins. The sort is by *blocker risk*, not by informativeness:
-# the question this report answers is "can this service go behind the F5, and if
-# not, why not", so the headline is the worst thing found across the service's
-# URLs. It only decides the headline when a service's URLs disagreed (see
-# `mixed`); nothing about probing or classification depends on it. Transport
-# errors (detected_method is None) are not auth verdicts — they're counted as
-# `unreachable`, not ranked.
-_VERDICT_PRECEDENCE: tuple[AuthMethod, ...] = (
-    # --- Blockers: exposure can't proceed as-is. ---
-    # Technical blocker. NTLM authenticates the TCP connection, not the request,
-    # so connection reuse/multiplexing at the proxy breaks the handshake.
-    AuthMethod.NTLM,
-    # Policy blocker, not a technical one — BASIC proxies fine. The objection is
-    # that credentials ride every request, and exposure sends them outward.
-    AuthMethod.BASIC,
-    # A named scheme we don't recognize (Digest, vendor schemes; the URL's
-    # www_authenticate says which). Ranked as a blocker by safe default —
-    # unrecognized means unsupported until someone confirms otherwise — not
-    # because any specific scheme is known to fail. Epistemically this is
-    # NEGOTIATE's tier; it sits above only because the safe assumption differs.
-    AuthMethod.OTHER,
-    # --- Needs review: may or may not block; a human has to look. ---
-    # Kerberos underneath is fine to expose; NTLM underneath is a blocker, and
-    # the challenge alone doesn't say which.
-    AuthMethod.NEGOTIATE,
-    # --- Exposable: concrete and known-good. ---
-    AuthMethod.BEARER,
-    AuthMethod.OAUTH,
-    AuthMethod.LOGIN_REDIRECT,
-    # UNKNOWN stays below the concrete verdicts and above UNAUTHENTICATED. By the
-    # NEGOTIATE argument it belongs in the review tier — a 401/403 with no
-    # WWW-Authenticate could be hiding NTLM. But UNKNOWN is a catch-all that also
-    # absorbs 404/400/5xx/407 and plain non-auth redirects, and stale URLs
-    # harvested from JS bundles 404 constantly, so promoting the whole bucket
-    # would flag most services for review on the strength of one dead path.
-    # Splitting out a distinct "gated, scheme undisclosed" verdict (401/403) is
-    # what would earn a spot next to NEGOTIATE.
-    # It still outranks UNAUTHENTICATED: if open won, one open endpoint (often the
-    # host root) would mask a restricted sibling in the headline — the false
-    # negative this scan exists to catch.
-    AuthMethod.UNKNOWN,
-    AuthMethod.UNAUTHENTICATED,
-)
 
 
 def _collapse_host_verdict(verdicts: set[AuthMethod]) -> AuthMethod | None:

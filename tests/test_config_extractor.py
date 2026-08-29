@@ -42,6 +42,7 @@ from config_extractor import (
     _collapse_host_verdict,
     resolve_hosts,
     _parse_www_authenticate,
+    _challenge_schemes,
     _classify_probe,
     _cookies_from_kv,
     _headers_from_kv,
@@ -993,6 +994,92 @@ class TestParseWwwAuthenticate:
         # UNKNOWN paired with a kept www_authenticate is unique to this case.
         assert _parse_www_authenticate("   ") == "unknown"
 
+    def test_params_without_a_scheme_is_unknown(self):
+        # Malformed: params but no scheme to attach them to. Nothing to rank, so
+        # the verdict is UNKNOWN and the raw header carries the oddity onward
+        # for whoever reads the report.
+        assert _parse_www_authenticate('realm="x"') == "unknown"
+
+
+class TestChallengeSchemes:
+    # _challenge_schemes is where the two comma meanings are told apart: commas
+    # separate challenges, but they also separate the auth-params *within* one
+    # challenge. Getting this wrong in either direction is a silent wrong
+    # verdict, so each shape is pinned separately.
+    def test_single_challenge(self):
+        assert _challenge_schemes('Basic realm="test"') == ["basic"]
+
+    def test_two_bare_schemes(self):
+        assert _challenge_schemes("Negotiate, NTLM") == ["negotiate", "ntlm"]
+
+    def test_no_space_after_comma(self):
+        assert _challenge_schemes("Negotiate,NTLM") == ["negotiate", "ntlm"]
+
+    def test_params_do_not_open_a_new_challenge(self):
+        # One Digest offer, not three. `qop=` and `nonce=` continue it.
+        assert _challenge_schemes(
+            'Digest realm="x", qop="auth", nonce="abc"') == ["digest"]
+
+    def test_scheme_after_a_parameterized_challenge(self):
+        # The hard middle case: the first challenge carries a param and the
+        # second is bare, so the same comma depth holds both meanings.
+        assert _challenge_schemes(
+            'Basic realm="x", Bearer') == ["basic", "bearer"]
+
+    def test_comma_inside_a_quoted_param_value(self):
+        # realm="a,b" is one param. Splitting on every comma would read `b"` as
+        # a scheme and invent an offer the server never made.
+        assert _challenge_schemes('Digest realm="a,b", qop="auth"') == ["digest"]
+
+    def test_bws_around_param_equals(self):
+        # RFC 9110 allows whitespace around `=`. Judging a piece by whether its
+        # first *token* contains `=` would read `realm = "x"` as a scheme name.
+        assert _challenge_schemes(
+            'Bearer realm = "x", error = "invalid_token"') == ["bearer"]
+
+    def test_token68_is_not_a_param(self):
+        # A Negotiate blob ends in `=` padding, but it is a token68 following
+        # the scheme, not a `key=value` param.
+        assert _challenge_schemes(
+            "Negotiate YIIZ3AYGKwYBBQUCoIIZ0DCCGcw=") == ["negotiate"]
+
+    def test_empty_pieces_are_skipped(self):
+        assert _challenge_schemes("Basic,,Bearer") == ["basic", "bearer"]
+
+
+class TestMultiChallengeVerdict:
+    # A response may offer several schemes at once. The client picks, so the F5
+    # has to survive whichever it picks — the verdict is the worst on offer, by
+    # the same _VERDICT_PRECEDENCE that collapses a service's URLs.
+    def test_negotiate_then_ntlm_is_ntlm(self):
+        # IIS's default offer. Reading only the leading token would report
+        # NEGOTIATE ("needs review") and lose the NTLM that actually blocks —
+        # NTLM authenticates the connection, which the proxy reuses.
+        assert _parse_www_authenticate("Negotiate, NTLM") == "ntlm"
+
+    def test_verdict_does_not_depend_on_server_ordering(self):
+        # Same offer, either order, same answer: the ranking decides, not the
+        # order the server happened to emit.
+        assert (_parse_www_authenticate("Negotiate, NTLM")
+                == _parse_www_authenticate("NTLM, Negotiate")
+                == "ntlm")
+
+    def test_three_way_offer_takes_the_blocker(self):
+        assert _parse_www_authenticate(
+            'Negotiate, NTLM, Basic realm="corp"') == "ntlm"
+
+    def test_named_blocker_outranks_the_catch_all(self):
+        # BASIC sits above OTHER: Basic says *why* it blocks, an unrecognized
+        # scheme only says we don't know. So the headline is the concrete one.
+        assert _parse_www_authenticate(
+            'Digest realm="x", Basic realm="y"') == "basic"
+
+    def test_single_challenge_verdict_is_unchanged(self):
+        # The parameterized single-challenge forms already worked; they must
+        # keep working now that the value is walked rather than tokenized once.
+        assert _parse_www_authenticate(
+            'Bearer realm="x", error="invalid_token"') == "bearer"
+
 
 class TestClassifyProbe:
     # _classify_probe returns a bare AuthMethod verdict. StrEnum members compare
@@ -1183,6 +1270,24 @@ def _create_auth_app(gated_root: bool = False):
             text="Forbidden",
         )
 
+    async def handle_multi_header_challenge(request):
+        # IIS's shape: one challenge per header line, Negotiate first. aiohttp
+        # keeps repeats as separate multidict entries, so a .get() would see the
+        # Negotiate and never the NTLM behind it.
+        resp = web.Response(status=401, text="Unauthorized")
+        resp.headers.add("WWW-Authenticate", "Negotiate")
+        resp.headers.add("WWW-Authenticate", "NTLM")
+        resp.headers.add("WWW-Authenticate", 'Basic realm="corp"')
+        return resp
+
+    async def handle_inline_challenge_list(request):
+        # The same offer folded into one comma-separated value.
+        return web.Response(
+            status=401,
+            headers={"WWW-Authenticate": "Negotiate, NTLM"},
+            text="Unauthorized",
+        )
+
     async def handle_bad_request(request):
         return web.Response(status=400, text="Bad Request")
 
@@ -1231,6 +1336,8 @@ def _create_auth_app(gated_root: bool = False):
     app.router.add_get("/auth/none", handle_no_auth)
     app.router.add_get("/auth/forbidden", handle_forbidden)
     app.router.add_get("/auth/forbidden-bearer", handle_forbidden_bearer)
+    app.router.add_get("/auth/multi-header", handle_multi_header_challenge)
+    app.router.add_get("/auth/multi-inline", handle_inline_challenge_list)
     app.router.add_get("/auth/bad-request", handle_bad_request)
     app.router.add_get("/auth/not-found", handle_not_found)
     app.router.add_get("/auth/redirect", handle_redirect)
@@ -1245,6 +1352,8 @@ def _create_auth_app(gated_root: bool = False):
     app.router.add_route("HEAD", "/auth/none", handle_no_auth)
     app.router.add_route("HEAD", "/auth/forbidden", handle_forbidden)
     app.router.add_route("HEAD", "/auth/forbidden-bearer", handle_forbidden_bearer)
+    app.router.add_route("HEAD", "/auth/multi-header", handle_multi_header_challenge)
+    app.router.add_route("HEAD", "/auth/multi-inline", handle_inline_challenge_list)
     app.router.add_route("HEAD", "/auth/bad-request", handle_bad_request)
     app.router.add_route("HEAD", "/auth/not-found", handle_not_found)
     app.router.add_route("HEAD", "/auth/redirect", handle_redirect)
@@ -1318,6 +1427,35 @@ async def test_probe_bearer_auth(auth_server):
     assert len(results) == 1
     assert results[0].status_code == 401
     assert results[0].detected_method == "bearer"
+
+
+@pytest.mark.asyncio
+async def test_probe_repeated_challenge_headers(auth_server):
+    """A server offering several schemes on separate header lines."""
+    results = await probe_urls([f"{auth_server}/auth/multi-header"], timeout=5.0)
+    assert len(results) == 1
+    assert results[0].status_code == 401
+    # aiohttp hands back only the first repeat from .get(), and the server sent
+    # Negotiate first. Verdict NEGOTIATE here would mean the NTLM on the next
+    # line — the blocker this scan exists to surface before the F5 fronts the
+    # service — never reached the report, decided by the server's header order.
+    assert results[0].detected_method == "ntlm"
+    # The evidence field keeps every challenge, not just the ranked one, so a
+    # human reading the report sees the whole offer.
+    assert results[0].www_authenticate == 'Negotiate, NTLM, Basic realm="corp"'
+
+
+@pytest.mark.asyncio
+async def test_probe_inline_challenge_list(auth_server):
+    """The same offer as one comma-separated value.
+
+    RFC 9110 §5.3 makes the repeated and comma-joined forms equivalent, so the
+    two must not reach different verdicts."""
+    results = await probe_urls([f"{auth_server}/auth/multi-inline"], timeout=5.0)
+    assert len(results) == 1
+    assert results[0].status_code == 401
+    assert results[0].detected_method == "ntlm"
+    assert results[0].www_authenticate == "Negotiate, NTLM"
 
 
 @pytest.mark.asyncio
