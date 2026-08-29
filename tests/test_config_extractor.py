@@ -43,6 +43,8 @@ from config_extractor import (
     resolve_hosts,
     _parse_www_authenticate,
     _challenge_schemes,
+    _VERDICT_PRECEDENCE,
+    _OFFER_PREFERENCE,
     _classify_probe,
     _cookies_from_kv,
     _headers_from_kv,
@@ -1048,37 +1050,80 @@ class TestChallengeSchemes:
 
 
 class TestMultiChallengeVerdict:
-    # A response may offer several schemes at once. The client picks, so the F5
-    # has to survive whichever it picks — the verdict is the worst on offer, by
-    # the same _VERDICT_PRECEDENCE that collapses a service's URLs.
-    def test_negotiate_then_ntlm_is_ntlm(self):
-        # IIS's default offer. Reading only the leading token would report
-        # NEGOTIATE ("needs review") and lose the NTLM that actually blocks —
-        # NTLM authenticates the connection, which the proxy reuses.
-        assert _parse_www_authenticate("Negotiate, NTLM") == "ntlm"
+    # A response's challenges are an offer to choose from, not a set of demands
+    # to satisfy — so the verdict is the *best* scheme available, by
+    # _OFFER_PREFERENCE. This is the opposite reduction to the one
+    # _collapse_host_verdict runs across a service's URLs, and the two are
+    # pinned against each other in TestOfferVsVerdictOrdering below.
+    def test_bearer_beside_basic_is_bearer(self):
+        # The case that decides the direction: this URL is exposable on Bearer,
+        # and the Basic it also accepts costs nothing because nothing has to use
+        # it. Reporting `basic` would flag a blocker the F5 declines to pick.
+        assert _parse_www_authenticate("Bearer, Basic") == "bearer"
+
+    def test_negotiate_beside_ntlm_is_negotiate(self):
+        # IIS's default offer. NEGOTIATE is the honest verdict — "needs review",
+        # since SPNEGO may resolve to Kerberos (exposable) or fall back to NTLM
+        # (blocker) — and that ambiguity is exactly what the verdict encodes.
+        assert _parse_www_authenticate("Negotiate, NTLM") == "negotiate"
 
     def test_verdict_does_not_depend_on_server_ordering(self):
-        # Same offer, either order, same answer: the ranking decides, not the
-        # order the server happened to emit.
+        # Convention puts the strongest scheme first, so taking the leading
+        # token usually lands here too — but on the server's ordering rather
+        # than ours. Either order, same answer.
         assert (_parse_www_authenticate("Negotiate, NTLM")
                 == _parse_www_authenticate("NTLM, Negotiate")
-                == "ntlm")
+                == "negotiate")
 
-    def test_three_way_offer_takes_the_blocker(self):
+    def test_three_way_offer_takes_the_best(self):
         assert _parse_www_authenticate(
-            'Negotiate, NTLM, Basic realm="corp"') == "ntlm"
+            'Negotiate, NTLM, Basic realm="corp"') == "negotiate"
 
-    def test_named_blocker_outranks_the_catch_all(self):
-        # BASIC sits above OTHER: Basic says *why* it blocks, an unrecognized
-        # scheme only says we don't know. So the headline is the concrete one.
+    def test_known_scheme_beats_the_catch_all(self):
+        # OTHER is last resort, not second choice: we would take the Basic we
+        # know how to proxy over gambling on an unrecognized scheme, even though
+        # OTHER outranks BASIC on *risk*. The safe default inverts here.
         assert _parse_www_authenticate(
             'Digest realm="x", Basic realm="y"') == "basic"
+
+    def test_unusable_offer_names_the_informative_blocker(self):
+        # Neither is usable. NTLM still wins over OTHER because it says *why*
+        # exposure fails — connection-bound auth against a reusing proxy —
+        # where OTHER only says we do not recognize the scheme.
+        assert _parse_www_authenticate("Digest, NTLM") == "ntlm"
 
     def test_single_challenge_verdict_is_unchanged(self):
         # The parameterized single-challenge forms already worked; they must
         # keep working now that the value is walked rather than tokenized once.
         assert _parse_www_authenticate(
             'Bearer realm="x", error="invalid_token"') == "bearer"
+
+
+class TestOfferVsVerdictOrdering:
+    """The two reductions are deliberately opposed; pin the relationship so a
+    later edit to one ordering cannot silently drift from the other."""
+
+    def test_offer_preference_covers_every_challenge_scheme(self):
+        # Anything _parse_www_authenticate can produce from a challenge has to
+        # be rankable, or the verdict would fall through to UNKNOWN.
+        assert set(_OFFER_PREFERENCE) == {
+            AuthMethod.BASIC, AuthMethod.BEARER, AuthMethod.NEGOTIATE,
+            AuthMethod.NTLM, AuthMethod.OTHER,
+        }
+
+    def test_known_schemes_are_the_risk_order_reversed(self):
+        # For the four schemes whose risk is actually known, preferring the best
+        # of an offer is exactly the inverse of fearing the worst of a service.
+        known = [m for m in _OFFER_PREFERENCE if m is not AuthMethod.OTHER]
+        risk = [m for m in _VERDICT_PRECEDENCE if m in set(known)]
+        assert known == list(reversed(risk))
+
+    def test_other_is_last_resort_not_a_mirror_of_its_risk_rank(self):
+        # The one member that does not survive the flip. OTHER sits third on
+        # risk (a safe default about an unknown) but last on preference: we
+        # would never claim to pick the scheme we just called unsupported.
+        assert _OFFER_PREFERENCE[-1] is AuthMethod.OTHER
+        assert _VERDICT_PRECEDENCE.index(AuthMethod.OTHER) <             _VERDICT_PRECEDENCE.index(AuthMethod.NEGOTIATE)
 
 
 class TestClassifyProbe:
@@ -1435,13 +1480,13 @@ async def test_probe_repeated_challenge_headers(auth_server):
     results = await probe_urls([f"{auth_server}/auth/multi-header"], timeout=5.0)
     assert len(results) == 1
     assert results[0].status_code == 401
-    # aiohttp hands back only the first repeat from .get(), and the server sent
-    # Negotiate first. Verdict NEGOTIATE here would mean the NTLM on the next
-    # line — the blocker this scan exists to surface before the F5 fronts the
-    # service — never reached the report, decided by the server's header order.
-    assert results[0].detected_method == "ntlm"
-    # The evidence field keeps every challenge, not just the ranked one, so a
-    # human reading the report sees the whole offer.
+    # The offer is ours to choose from, so the verdict is the best of it.
+    assert results[0].detected_method == "negotiate"
+    # The point of the fix is here rather than in the verdict: aiohttp keeps
+    # repeats as separate entries and .get() returns only the first, so without
+    # reading every line the NTLM and Basic this server also accepts would be
+    # absent from the report entirely — and those are what an operator needs in
+    # order to disagree with the verdict.
     assert results[0].www_authenticate == 'Negotiate, NTLM, Basic realm="corp"'
 
 
@@ -1454,7 +1499,7 @@ async def test_probe_inline_challenge_list(auth_server):
     results = await probe_urls([f"{auth_server}/auth/multi-inline"], timeout=5.0)
     assert len(results) == 1
     assert results[0].status_code == 401
-    assert results[0].detected_method == "ntlm"
+    assert results[0].detected_method == "negotiate"
     assert results[0].www_authenticate == "Negotiate, NTLM"
 
 
@@ -1708,6 +1753,20 @@ def test_collapse_ranks_by_blocker_risk():
     # is dominated by 404s from stale config URLs.
     assert _collapse_host_verdict(
         {AuthMethod.BEARER, AuthMethod.UNKNOWN}) == AuthMethod.BEARER
+
+
+def test_collapse_blocks_on_one_bad_url_though_an_offer_would_not():
+    """The conjunction/disjunction contrast, in the two shapes it arrives in.
+
+    A service whose one URL takes only Bearer and whose other takes only NTLM is
+    blocked: exposing the service means exposing both, and the NTLM path has no
+    other scheme to fall back to. A *single* URL offering both is not blocked —
+    the F5 picks Bearer and the NTLM goes unused. Same two schemes, opposite
+    answers, because one set has to be satisfied and the other only chosen
+    from."""
+    assert _collapse_host_verdict(
+        {AuthMethod.BEARER, AuthMethod.NTLM}) == AuthMethod.NTLM
+    assert _parse_www_authenticate("Bearer, NTLM") == AuthMethod.BEARER
 
 
 def test_merge_root_probes_inserts_synthesized():

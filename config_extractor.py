@@ -50,15 +50,17 @@ class AuthMethod(StrEnum):
     UNKNOWN = "unknown"
 
 
-# Risk ranking over the auth verdicts; earlier wins. The sort is by *blocker
-# risk*, not by informativeness: the question this report answers is "can this
-# service go behind the F5, and if not, why not", so the answer is the worst
-# thing found. Two consumers ask that question of different sets, and neither
-# changes how a single response is probed: _collapse_host_verdict, over the
-# verdicts of a service's URLs when they disagreed (see `mixed`), and
-# _parse_www_authenticate, over the schemes of one response that offered several
-# challenges at once. Transport errors (detected_method is None) are not auth
-# verdicts — they're counted as `unreachable`, not ranked.
+# Precedence for collapsing a service's per-URL auth verdicts into one headline
+# method. Earlier wins. The sort is by *blocker risk*, not by informativeness:
+# the question this report answers is "can this service go behind the F5, and if
+# not, why not", so the headline is the worst thing found across the service's
+# URLs. The URLs are a conjunction — exposing the service means every one of
+# them has to work through the F5, so a single NTLM-only path blocks it however
+# clean its siblings are. Contrast _OFFER_PREFERENCE below, which reduces a set
+# the other way for the opposite reason. It only decides the headline when a
+# service's URLs disagreed (see `mixed`); nothing about probing depends on it.
+# Transport errors (detected_method is None) are not auth verdicts — they're
+# counted as `unreachable`, not ranked.
 _VERDICT_PRECEDENCE: tuple[AuthMethod, ...] = (
     # --- Blockers: exposure can't proceed as-is. ---
     # Technical blocker. NTLM authenticates the TCP connection, not the request,
@@ -94,6 +96,32 @@ _VERDICT_PRECEDENCE: tuple[AuthMethod, ...] = (
     # negative this scan exists to catch.
     AuthMethod.UNKNOWN,
     AuthMethod.UNAUTHENTICATED,
+)
+
+# Which scheme we would actually use when ONE response offers several at once,
+# most preferred first. Used by _parse_www_authenticate; only the five schemes a
+# challenge can name appear here.
+#
+# The reduction runs opposite to _VERDICT_PRECEDENCE because the set means
+# something else. A response's challenges are a disjunction, not a conjunction:
+# RFC 9110 §11.6.1 has the client pick the strongest scheme it understands, and
+# here the F5 is that client. `Bearer, Basic` is exposable on Bearer, and the
+# Basic it also offers costs nothing because nothing has to use it. Taking the
+# worst of an offer would report a blocker the F5 would simply decline to pick.
+#
+# It is NOT _VERDICT_PRECEDENCE reversed, because OTHER does not survive the
+# flip. OTHER ranks high there by safe default — unrecognized means unsupported
+# until someone confirms otherwise — and a safe default inverts with the
+# question: conservative about the worst of a conjunction, it becomes reckless
+# about the best of a disjunction, claiming we would pick the one scheme we just
+# said we cannot support. So OTHER moves to the bottom, last resort; the four
+# schemes whose risk is actually known keep their relative order, reversed.
+_OFFER_PREFERENCE: tuple[AuthMethod, ...] = (
+    AuthMethod.BEARER,
+    AuthMethod.NEGOTIATE,
+    AuthMethod.BASIC,
+    AuthMethod.NTLM,
+    AuthMethod.OTHER,
 )
 
 
@@ -203,17 +231,22 @@ def _parse_www_authenticate(header: str) -> AuthMethod:
     well-formed one to OTHER, and a header that names no scheme at all — empty,
     whitespace, or nothing but auth-params — to UNKNOWN.
 
-    A server may offer several schemes at once, and on this estate the common
-    case is IIS's `Negotiate` ahead of `NTLM`. Every offer is real: the client
-    picks, so the F5 has to survive whichever it picks. The verdict is therefore
-    the highest-risk scheme on offer, by _VERDICT_PRECEDENCE — reading the first
-    one instead would let the server's header order decide whether the NTLM
-    behind a leading `Negotiate` ever reaches the report."""
+    A server may offer several schemes at once — on this estate usually IIS's
+    `Negotiate` ahead of `NTLM`. The offer is the client's to choose from, so
+    the verdict is the scheme we would pick, the best on offer by
+    _OFFER_PREFERENCE. Note this is the opposite reduction to the one
+    _collapse_host_verdict runs over a service's URLs, because a service's URLs
+    all have to work and a response's challenges only need one to.
+
+    Convention puts the strongest scheme first, so reading the leading token
+    would usually land in the same place — but on the server's ordering, not on
+    ours, and the whole offer is on ProbeResult.www_authenticate either way for
+    anyone who needs to see what else was accepted."""
     offered = {
         AuthMethod(s) if s in _KNOWN_SCHEMES else AuthMethod.OTHER
         for s in _challenge_schemes(header)
     }
-    for method in _VERDICT_PRECEDENCE:
+    for method in _OFFER_PREFERENCE:
         if method in offered:
             return method
     return AuthMethod.UNKNOWN
