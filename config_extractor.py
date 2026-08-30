@@ -1458,36 +1458,47 @@ def _collapse_host_verdict(verdicts: set[AuthMethod]) -> AuthMethod | None:
     return None
 
 
-def _url_evidence(info: "AuthInfo | None") -> dict:
+def _url_evidence(info: "AuthInfo | None",
+                  sources: list[str] | None = None) -> dict:
     """Render one URL's probe evidence as emitted under a service's `urls`.
 
     Null fields are omitted rather than serialized: most probes set two or three
     of the six, and spelling out the nulls cost more bytes than the evidence.
-    An empty dict is therefore a real answer — "discovered, never probed" — not a
-    missing one. `synthesized` marks a host root the scanner probed on its own
+    An entry with no probe fields is therefore a real answer — "discovered,
+    never probed" — not a missing one; for a config-referenced URL that leaves
+    just its `sources`. `synthesized` marks a host root the scanner probed on its own
     initiative (see AuthInfo.synthesized): it is listed among the service's URLs
     because it is the evidence behind the verdict, and flagged because the config
-    never referenced it."""
+    never referenced it.
+
+    `sources` is that URL's provenance: every config source whose extracted URLs
+    included it, in discovery order. It answers the question the probe evidence
+    can't — whether anything on the estate actually meant to call this — since a
+    URL only a vendor bundle mentions is string noise, while the same URL in the
+    app's own runtime config is a real dependency. Plural because one URL is
+    routinely compiled into several chunks, and the fan-out is itself signal.
+    Omitted when empty, which is exactly what a `synthesized` root is: reached on
+    the scanner's own initiative, named by no config. Last in the entry, being
+    the only unbounded field in it."""
     entry: dict = {}
-    if info is None:
-        return entry
-    if info.synthesized:
+    p = info.probe_result if info is not None else None
+    if info is not None and info.synthesized:
         entry["synthesized"] = True
-    p = info.probe_result
-    if p is None:
-        return entry
-    if p.status_code is not None:
-        entry["status_code"] = p.status_code
-    if p.www_authenticate is not None:
-        entry["www_authenticate"] = p.www_authenticate
-    if p.location is not None:
-        entry["location"] = p.location
-    if p.detected_method is not None:
-        entry["detected_method"] = p.detected_method
-    if p.root_discloses is not None:
-        entry["root_discloses"] = p.root_discloses
-    if p.error is not None:
-        entry["error"] = p.error
+    if p is not None:
+        if p.status_code is not None:
+            entry["status_code"] = p.status_code
+        if p.www_authenticate is not None:
+            entry["www_authenticate"] = p.www_authenticate
+        if p.location is not None:
+            entry["location"] = p.location
+        if p.detected_method is not None:
+            entry["detected_method"] = p.detected_method
+        if p.root_discloses is not None:
+            entry["root_discloses"] = p.root_discloses
+        if p.error is not None:
+            entry["error"] = p.error
+    if sources:
+        entry["sources"] = sources
     return entry
 
 
@@ -1499,6 +1510,11 @@ def write_results(
     ip_map: dict[str, list[str]] | None = None,
 ) -> None:
     all_clean: set[str] = set()
+    # The `sources` list inverted: URL -> the origins that referenced it, which
+    # is how each service's per-URL evidence carries its provenance. Kept as a
+    # separate index rather than derived later because this loop is the only
+    # place the two are still associated.
+    url_sources: dict[str, list[str]] = {}
     suspect_index: dict[str, dict] = {}
     entries = []
     for src in sources:
@@ -1509,6 +1525,10 @@ def write_results(
             "error": src.error,
         })
         all_clean.update(clean)
+        for url in clean:
+            origins = url_sources.setdefault(url, [])
+            if src.origin not in origins:
+                origins.append(src.origin)
         for url, reason in suspect:
             entry = suspect_index.setdefault(url, {"reason": reason, "sources": []})
             if src.origin not in entry["sources"]:
@@ -1544,7 +1564,10 @@ def write_results(
     # 404s — the raw WWW-Authenticate behind an `other`, why a probe failed at the
     # transport. It is the union of the clean URLs the configs referenced and any
     # host root probed on our own initiative, the latter flagged `synthesized` so
-    # the output never implies the app referenced `/` when it didn't.
+    # the output never implies the app referenced `/` when it didn't. Each URL
+    # also carries its `sources` — the config origins that referenced it, the
+    # top-level `sources` array inverted — so the provenance is readable at the
+    # point of decision instead of by hand-searching that array backwards.
     unresolved_set = {e["host"] for e in unresolved} if unresolved else set()
     resolved_services = {s for s in services
                          if urlparse(s).hostname not in unresolved_set}
@@ -1573,7 +1596,8 @@ def write_results(
                                if not p or p.detected_method is None),
             # Last: the only unbounded field, so the verdict stays at the top of
             # each service block.
-            "urls": {url: _url_evidence(infos.get(url)) for url in
+            "urls": {url: _url_evidence(infos.get(url), url_sources.get(url))
+                     for url in
                      sorted(set(service_urls.get(svc, [])) | set(infos))},
         }
 

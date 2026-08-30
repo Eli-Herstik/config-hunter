@@ -686,9 +686,11 @@ def test_write_results_services_map_collapses_and_filters(tmp_path):
     # and status, with null fields omitted entirely.
     assert svc["urls"] == {
         "https://svc.example.com/": {
-            "status_code": 200, "detected_method": "unauthenticated"},
+            "status_code": 200, "detected_method": "unauthenticated",
+            "sources": ["js: https://app/bundle.js"]},
         "https://svc.example.com/api": {
-            "status_code": 401, "detected_method": "bearer"},
+            "status_code": 401, "detected_method": "bearer",
+            "sources": ["js: https://app/bundle.js"]},
     }
     assert svc["mixed"] is True
     assert svc["urls_probed"] == 2
@@ -700,7 +702,9 @@ def test_write_results_services_map_collapses_and_filters(tmp_path):
     # The error string survives the collapse — `unreachable` alone would not say
     # whether this host refused the connection, timed out, or failed TLS.
     assert down["urls"] == {
-        "https://down.example.com/x": {"error": "Cannot connect to host"},
+        "https://down.example.com/x": {
+            "error": "Cannot connect to host",
+            "sources": ["js: https://app/bundle.js"]},
     }
     assert down["mixed"] is False
     assert down["urls_probed"] == 1
@@ -814,7 +818,8 @@ def test_write_results_services_list_their_urls(tmp_path):
     # Each key carries that URL's own evidence, not just its name.
     assert services["https://svc.example.com"]["urls"][
         "https://svc.example.com/a-api"] == {
-            "status_code": 200, "detected_method": "unauthenticated"}
+            "status_code": 200, "detected_method": "unauthenticated",
+            "sources": ["network: https://svc.example.com/config.json"]}
     # The other port's URL didn't leak into the first service's list.
     assert list(services["https://svc.example.com:8443"]["urls"]) == [
         "https://svc.example.com:8443/admin",
@@ -866,6 +871,62 @@ def test_write_results_services_urls_flag_synthesized_roots(tmp_path):
     assert "auth" not in data
 
 
+def test_write_results_urls_carry_their_sources(tmp_path):
+    """Each service URL carries `sources`: the config origins that referenced
+    it — the top-level `sources` array inverted, so provenance is readable at
+    the point the exposure decision is made instead of by searching that array
+    backwards. Plural and in discovery order, since one URL is routinely
+    compiled into several bundles; absent for a root the scanner synthesized,
+    which no config ever named."""
+    sources = [
+        ConfigSource(
+            origin="js: https://app/vendor.js",
+            urls_found=[
+                "https://svc.example.com/shared",
+                "https://svc.example.com/vendor-only",  # discovered, unprobed
+            ],
+        ),
+        ConfigSource(  # a second origin referencing one of the same URLs
+            origin="network: https://app/config.json",
+            urls_found=["https://svc.example.com/shared"],
+        ),
+    ]
+    auth_map = {
+        "https://svc.example.com/shared": _auth_info(
+            "https://svc.example.com/shared", AuthMethod.UNAUTHENTICATED),
+        "https://svc.example.com/": AuthInfo(
+            url="https://svc.example.com/",
+            probe_result=ProbeResult(
+                url="https://svc.example.com/", status_code=200,
+                www_authenticate=None,
+                detected_method=AuthMethod.UNAUTHENTICATED),
+            synthesized=True,
+        ),
+    }
+    out = tmp_path / "r.json"
+    write_results(sources, str(out), auth_map, [], {"svc.example.com": ["10.0.0.5"]})
+    with open(out, "r", encoding="utf-8") as f:
+        data = json.load(f)
+
+    urls = data["services"]["https://svc.example.com"]["urls"]
+    # Every origin that referenced it, deduped, in the order the sources were
+    # collected: the fan-out is itself signal that this is real app config and
+    # not one vendor bundle's string noise.
+    assert urls["https://svc.example.com/shared"]["sources"] == [
+        "js: https://app/vendor.js",
+        "network: https://app/config.json",
+    ]
+    # Discovered but never probed: the provenance is then the whole entry, and
+    # an empty dict no longer has to stand in for "nothing is known about this".
+    assert urls["https://svc.example.com/vendor-only"] == {
+        "sources": ["js: https://app/vendor.js"]}
+    # The synthesized root is ours, not the config's, so it has no source to
+    # name and the key is omitted rather than emitted empty.
+    assert "sources" not in urls["https://svc.example.com/"]
+    # Last in the entry, being the only unbounded field in it.
+    assert list(urls["https://svc.example.com/shared"])[-1] == "sources"
+
+
 def test_write_results_urls_carry_redirect_location(tmp_path):
     """A redirect's Location is emitted as the evidence behind the verdict:
     `oauth` says a service federates, the header says to whom."""
@@ -891,6 +952,7 @@ def test_write_results_urls_carry_redirect_location(tmp_path):
         "https://svc.example.com/api"] == {
         "status_code": 302, "detected_method": "oauth",
         "location": "https://sso.corp.local/oauth2/authorize?client_id=x",
+        "sources": ["js: https://app/bundle.js"],
     }
 
 
