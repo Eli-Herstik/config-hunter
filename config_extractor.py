@@ -538,25 +538,24 @@ async def probe_urls_with_roots(
     return path_probes, root_probes
 
 
-def merge_probe_results(auth_map: dict[str, AuthInfo], probes: list[ProbeResult]) -> None:
-    """Merge probe results into the auth map."""
-    for probe in probes:
-        if probe.url in auth_map:
-            auth_map[probe.url].probe_result = probe
+def build_auth_map(path_probes: list[ProbeResult],
+                   root_probes: list[ProbeResult]) -> dict[str, AuthInfo]:
+    """Build the url -> AuthInfo map the report is written from.
 
+    The path probes alone account for every probeable URL: probe_urls returns
+    exactly one result per URL it was given, a transport failure included (that
+    comes back as a ProbeResult carrying `error`, never as a missing entry).
 
-def merge_root_probes(auth_map: dict[str, AuthInfo], root_probes: list[ProbeResult]) -> None:
-    """Insert host-root probes as new auth_map entries. If the root URL is
-    already a key, the config genuinely referenced it — fold the probe in and
-    leave `synthesized` False, so a discovered root is treated like any other
-    discovered URL."""
+    Host roots we probed on our own initiative are added as new entries marked
+    `synthesized`. A root the config genuinely referenced is already among the path
+    probes — probe_urls_with_roots never re-probes a URL it was handed — so
+    setdefault keeps that URL's own probe and leaves it unmarked, a discovered
+    URL like any other."""
+    auth_map = {p.url: AuthInfo(url=p.url, probe_result=p) for p in path_probes}
     for probe in root_probes:
-        existing = auth_map.get(probe.url)
-        if existing is None:
-            auth_map[probe.url] = AuthInfo(
-                url=probe.url, probe_result=probe, synthesized=True)
-        elif existing.probe_result is None:
-            existing.probe_result = probe
+        auth_map.setdefault(
+            probe.url, AuthInfo(url=probe.url, probe_result=probe, synthesized=True))
+    return auth_map
 
 
 # ---------------------------------------------------------------------------
@@ -1708,7 +1707,7 @@ def main() -> None:
         if unresolved_set:
             probeable_urls = [u for u in unique_urls if urlparse(u).hostname not in unresolved_set]
 
-    auth_map: dict[str, AuthInfo] = {url: AuthInfo(url=url) for url in probeable_urls}
+    auth_map: dict[str, AuthInfo] = {}
 
     if probeable_urls:
         skipped = len(unique_urls) - len(probeable_urls)
@@ -1721,8 +1720,7 @@ def main() -> None:
             cookies=probe_cookies or None,
             headers=cli_headers or None,
         ))
-        merge_probe_results(auth_map, path_probes)
-        merge_root_probes(auth_map, root_probes)
+        auth_map = build_auth_map(path_probes, root_probes)
         if root_probes:
             print(f"  probed {len(root_probes)} host root(s) to disclose undisclosed auth")
 

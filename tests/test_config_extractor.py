@@ -37,8 +37,7 @@ from config_extractor import (
     _service_key,
     probe_urls,
     probe_urls_with_roots,
-    merge_probe_results,
-    merge_root_probes,
+    build_auth_map,
     _collapse_host_verdict,
     resolve_hosts,
     _parse_www_authenticate,
@@ -1769,24 +1768,31 @@ def test_collapse_blocks_on_one_bad_url_though_an_offer_would_not():
     assert _parse_www_authenticate("Bearer, NTLM") == AuthMethod.BEARER
 
 
-def test_merge_root_probes_inserts_synthesized():
-    """A probed root that no config referenced is inserted as a synthesized entry."""
-    auth_map = {"https://h/x": AuthInfo(url="https://h/x")}
+def test_build_auth_map_inserts_synthesized_root():
+    """A probed root that no config referenced is inserted as a synthesized entry,
+    alongside the path probes, which keep their own verdicts."""
+    path = ProbeResult(url="https://h/x", status_code=401, www_authenticate=None,
+                       detected_method=AuthMethod.UNKNOWN)
     root = ProbeResult(url="https://h/", status_code=200, www_authenticate=None,
                        detected_method=AuthMethod.UNAUTHENTICATED)
-    merge_root_probes(auth_map, [root])
+    auth_map = build_auth_map([path], [root])
+    assert auth_map["https://h/x"].synthesized is False
+    assert auth_map["https://h/x"].probe_result is path
     assert auth_map["https://h/"].synthesized is True
     assert (auth_map["https://h/"].probe_result.detected_method
             == AuthMethod.UNAUTHENTICATED)
 
 
-def test_merge_root_probes_keeps_discovered_root_unmarked():
-    """A root the config already referenced is folded in WITHOUT the synthesized
-    mark — it's a genuine discovered URL, not one we invented."""
-    auth_map = {"https://h/": AuthInfo(url="https://h/")}  # discovered, unprobed
-    root = ProbeResult(url="https://h/", status_code=401, www_authenticate="Basic",
+def test_build_auth_map_keeps_discovered_root_unmarked():
+    """A root the config already referenced keeps its OWN probe and is left
+    WITHOUT the synthesized mark — it's a genuine discovered URL, not one we
+    invented. probe_urls_with_roots won't hand back both for one URL, so this
+    pins the tie-break rather than a case the pipeline produces."""
+    path = ProbeResult(url="https://h/", status_code=401, www_authenticate="Basic",
                        detected_method=AuthMethod.BASIC)
-    merge_root_probes(auth_map, [root])
+    root = ProbeResult(url="https://h/", status_code=200, www_authenticate=None,
+                       detected_method=AuthMethod.UNAUTHENTICATED)
+    auth_map = build_auth_map([path], [root])
     assert auth_map["https://h/"].synthesized is False
     assert auth_map["https://h/"].probe_result.detected_method == AuthMethod.BASIC
 
@@ -1796,9 +1802,8 @@ async def test_write_results_with_auth(auth_server, tmp_path):
     """Probe evidence reaches the report under each service's `urls`."""
     sources = await crawl(auth_server, timeout=10000, wait_after_load=2000)
     all_urls = list({u for s in sources for u in s.urls_found})
-    auth_map = {u: AuthInfo(url=u) for u in all_urls}
     probes = await probe_urls(all_urls, timeout=5.0)
-    merge_probe_results(auth_map, probes)
+    auth_map = build_auth_map(probes, [])
 
     out_path = str(tmp_path / "results_auth.json")
     # unresolved=[] is the shape main() always passes: the DNS pass ran and every
@@ -2056,7 +2061,6 @@ async def test_probe_filtering_skips_unresolved_hosts(test_server):
     unique_urls = [good_url, bad_url]
 
     # Replicate the main() flow: resolve, filter, probe, then check auth_map.
-    auth_map = {u: AuthInfo(url=u) for u in unique_urls}
     hosts = sorted({urlparse(u).hostname for u in unique_urls if urlparse(u).hostname})
     unresolved, _ = await resolve_hosts(hosts)
     unresolved_set = {entry["host"] for entry in unresolved}
@@ -2065,14 +2069,11 @@ async def test_probe_filtering_skips_unresolved_hosts(test_server):
     assert "127.0.0.1" not in unresolved_set
 
     probeable = [u for u in unique_urls if urlparse(u).hostname not in unresolved_set]
-    for url in unique_urls:
-        if urlparse(url).hostname in unresolved_set:
-            del auth_map[url]
 
     assert probeable == [good_url]
 
     probes = await probe_urls(probeable, timeout=5.0)
-    merge_probe_results(auth_map, probes)
+    auth_map = build_auth_map(probes, [])
 
     assert bad_url not in auth_map
     assert auth_map[good_url].probe_result is not None
