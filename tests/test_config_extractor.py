@@ -927,6 +927,128 @@ def test_write_results_urls_carry_their_sources(tmp_path):
     assert list(urls["https://svc.example.com/shared"])[-1] == "sources"
 
 
+def test_write_results_unresolved_hosts_carry_their_urls(tmp_path):
+    """Each unresolved host carries the URLs behind the failed lookup.
+
+    The services map is restricted to hosts that resolved, so a config-referenced
+    URL on a host DNS could not answer for has nowhere else to appear: without
+    this it would survive only as a bare hostname, losing the path and the
+    provenance that make a name that doesn't resolve worth chasing on an internal
+    estate. Grouped by hostname because that is the unit DNS failed on — one bad
+    name takes down every scheme and port that would otherwise have been its own
+    service."""
+    sources = [
+        ConfigSource(
+            origin="network: https://app/config.json",
+            urls_found=[
+                "https://internal-only.corp/api/v1",
+                "https://internal-only.corp:8443/admin",  # same name, own service
+                "https://ok.example.com/x",
+            ],
+        ),
+        ConfigSource(  # a second origin, so the provenance survives plural
+            origin="js: https://app/main.js",
+            urls_found=["https://internal-only.corp/api/v1"],
+        ),
+    ]
+    out = tmp_path / "r.json"
+    write_results(
+        sources, str(out),
+        {"https://ok.example.com/x": _auth_info(
+            "https://ok.example.com/x", AuthMethod.UNAUTHENTICATED)},
+        [{"host": "internal-only.corp", "error": "NXDOMAIN"},
+         {"host": "never-referenced.corp", "error": "timeout"}],
+        {"ok.example.com": ["1.2.3.4"]},
+    )
+    with open(out, "r", encoding="utf-8") as f:
+        data = json.load(f)
+
+    failures = {e["host"]: e for e in data["unresolved_hosts"]}
+    # The original {host, error} is untouched; `urls` is added to it, last,
+    # being the only unbounded field in the entry.
+    assert failures["internal-only.corp"]["error"] == "NXDOMAIN"
+    assert list(failures["internal-only.corp"])[-1] == "urls"
+    # Both ports land under the one hostname: DNS has no notion of port, so the
+    # failure is the name's, not either service's.
+    assert set(failures["internal-only.corp"]["urls"]) == {
+        "https://internal-only.corp/api/v1",
+        "https://internal-only.corp:8443/admin",
+    }
+    # Rendered with the same per-URL evidence shape as a service's `urls`, which
+    # for a URL nothing probed is its provenance alone — every origin that
+    # referenced it, in discovery order.
+    assert failures["internal-only.corp"]["urls"][
+        "https://internal-only.corp/api/v1"] == {
+        "sources": ["network: https://app/config.json", "js: https://app/main.js"]}
+    # A host no clean URL named omits `urls` rather than emitting it empty.
+    assert "urls" not in failures["never-referenced.corp"]
+
+    # Between them, the two sections account for every clean URL: nothing the
+    # configs referenced is reachable only through the top-level `sources` array.
+    placed = {u for e in data["unresolved_hosts"] for u in e.get("urls", {})}
+    placed |= {u for svc in data["services"].values() for u in svc["urls"]}
+    assert placed >= {u for e in data["sources"] for u in e["urls"]}
+
+
+def test_write_results_urls_flag_unparsed_sources(tmp_path):
+    """A URL flags the sources of its own that never parsed.
+
+    `error` on a source means a payload that was expected to be JSON was not, so
+    its URLs were regex-scraped out of unstructured text — a confidence qualifier
+    that belongs where the exposure call is made, not in a separate array read
+    backwards. The decode message stays in the top-level `source_errors`, once
+    per origin, because it is diagnostic rather than decisive."""
+    sources = [
+        ConfigSource(
+            origin="network: https://app/config.json",
+            urls_found=["https://svc.example.com/scraped",
+                        "https://svc.example.com/shared"],
+            error="Expecting value: line 1 column 1 (char 0)",
+        ),
+        ConfigSource(  # parsed cleanly, and names one of the same URLs
+            origin="js: https://app/main.js",
+            urls_found=["https://svc.example.com/shared"],
+        ),
+    ]
+    out = tmp_path / "r.json"
+    write_results(sources, str(out), {}, [], {"svc.example.com": ["10.0.0.5"]})
+    with open(out, "r", encoding="utf-8") as f:
+        data = json.load(f)
+
+    urls = data["services"]["https://svc.example.com"]["urls"]
+    # Always a subset of the URL's own `sources`, and last in the entry.
+    assert urls["https://svc.example.com/scraped"]["unparsed_sources"] == [
+        "network: https://app/config.json"]
+    assert list(urls["https://svc.example.com/scraped"])[-1] == "unparsed_sources"
+    # A URL a second, parsed source also named keeps that source out of the
+    # flag: it was seen inside a structure something could parse.
+    assert urls["https://svc.example.com/shared"]["sources"] == [
+        "network: https://app/config.json", "js: https://app/main.js"]
+    assert urls["https://svc.example.com/shared"]["unparsed_sources"] == [
+        "network: https://app/config.json"]
+    # The message is kept once, keyed by origin, not repeated per URL.
+    assert data["source_errors"] == {
+        "network: https://app/config.json": "Expecting value: line 1 column 1 (char 0)"}
+
+
+def test_write_results_omits_unparsed_fields_when_everything_parsed(tmp_path):
+    """Both are omitted when no source failed, which is the usual case: a URL
+    with no `unparsed_sources` was seen in a parsed structure, and the absence
+    is the answer rather than a missing field."""
+    sources = [ConfigSource(
+        origin="js: https://app/main.js",
+        urls_found=["https://svc.example.com/api"],
+    )]
+    out = tmp_path / "r.json"
+    write_results(sources, str(out), {}, [], {"svc.example.com": ["10.0.0.5"]})
+    with open(out, "r", encoding="utf-8") as f:
+        data = json.load(f)
+
+    assert "source_errors" not in data
+    urls = data["services"]["https://svc.example.com"]["urls"]
+    assert "unparsed_sources" not in urls["https://svc.example.com/api"]
+
+
 def test_write_results_urls_carry_redirect_location(tmp_path):
     """A redirect's Location is emitted as the evidence behind the verdict:
     `oauth` says a service federates, the header says to whom."""

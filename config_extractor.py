@@ -1459,7 +1459,8 @@ def _collapse_host_verdict(verdicts: set[AuthMethod]) -> AuthMethod | None:
 
 
 def _url_evidence(info: "AuthInfo | None",
-                  sources: list[str] | None = None) -> dict:
+                  sources: list[str] | None = None,
+                  unparsed_sources: list[str] | None = None) -> dict:
     """Render one URL's probe evidence as emitted under a service's `urls`.
 
     Null fields are omitted rather than serialized: most probes set two or three
@@ -1478,8 +1479,21 @@ def _url_evidence(info: "AuthInfo | None",
     app's own runtime config is a real dependency. Plural because one URL is
     routinely compiled into several chunks, and the fan-out is itself signal.
     Omitted when empty, which is exactly what a `synthesized` root is: reached on
-    the scanner's own initiative, named by no config. Last in the entry, being
-    the only unbounded field in it."""
+    the scanner's own initiative, named by no config.
+
+    `unparsed_sources` is the subset of `sources` whose payload never parsed, so
+    the URL was regex-scraped out of unstructured text instead of read from a
+    parsed structure — a confidence qualifier on the URL, not a fact about the
+    endpoint. Only sources that were expected to be JSON can appear: a `js:`
+    bundle is always scraped by regex and its origin prefix already says so. A
+    URL listing every one of its sources here was never seen inside a structure
+    anything could parse. The decode message for each origin is in the top-level
+    `source_errors`: the flag repeats per URL because that is where the exposure
+    call is made, the message is stored once because it is diagnostic rather than
+    decisive. Omitted when empty, the common case.
+
+    `sources` and `unparsed_sources` are last in the entry, being the only
+    unbounded fields in it."""
     entry: dict = {}
     p = info.probe_result if info is not None else None
     if info is not None and info.synthesized:
@@ -1499,6 +1513,8 @@ def _url_evidence(info: "AuthInfo | None",
             entry["error"] = p.error
     if sources:
         entry["sources"] = sources
+    if unparsed_sources:
+        entry["unparsed_sources"] = unparsed_sources
     return entry
 
 
@@ -1515,6 +1531,12 @@ def write_results(
     # separate index rather than derived later because this loop is the only
     # place the two are still associated.
     url_sources: dict[str, list[str]] = {}
+    # The same inversion narrowed to the sources that failed to parse (see
+    # _url_evidence): URL -> the subset of its origins that were only
+    # regex-scraped. The decode messages are collected once, keyed by origin,
+    # instead of being repeated on every URL a single broken source contributed.
+    url_unparsed: dict[str, list[str]] = {}
+    source_errors: dict[str, str] = {}
     suspect_index: dict[str, dict] = {}
     entries = []
     for src in sources:
@@ -1524,11 +1546,17 @@ def write_results(
             "urls": clean,
             "error": src.error,
         })
+        if src.error is not None:
+            source_errors[src.origin] = src.error
         all_clean.update(clean)
         for url in clean:
             origins = url_sources.setdefault(url, [])
             if src.origin not in origins:
                 origins.append(src.origin)
+            if src.error is not None:
+                unparsed = url_unparsed.setdefault(url, [])
+                if src.origin not in unparsed:
+                    unparsed.append(src.origin)
         for url, reason in suspect:
             entry = suspect_index.setdefault(url, {"reason": reason, "sources": []})
             if src.origin not in entry["sources"]:
@@ -1596,7 +1624,8 @@ def write_results(
                                if not p or p.detected_method is None),
             # Last: the only unbounded field, so the verdict stays at the top of
             # each service block.
-            "urls": {url: _url_evidence(infos.get(url), url_sources.get(url))
+            "urls": {url: _url_evidence(infos.get(url), url_sources.get(url),
+                                        url_unparsed.get(url))
                      for url in
                      sorted(set(service_urls.get(svc, [])) | set(infos))},
         }
@@ -1606,14 +1635,43 @@ def write_results(
         for url, entry in sorted(suspect_index.items())
     ]
 
-    output: dict = {
-        "sources": entries,
-        "suspect_urls": suspect_urls,
-    }
+    # Each failed lookup carries the URLs behind it, not just the hostname. A
+    # name that doesn't resolve from the scanner's vantage point is a finding on
+    # an internal estate, and the path and provenance are what make it one — and
+    # these URLs appear nowhere else in the report, since the services map is
+    # restricted to hosts that resolved. Rendered with the same per-URL evidence
+    # shape as a service's `urls`, which for a URL nothing probed (DNS failed, so
+    # no probe was attempted) is its provenance alone. Grouped by hostname
+    # because that is what DNS failed on: one bad name takes down every scheme
+    # and port that would otherwise have been its own service.
+    host_urls: dict[str, list[str]] = {}
+    for url in sorted(all_clean):
+        host = urlparse(url).hostname
+        if host in unresolved_set:
+            host_urls.setdefault(host, []).append(url)
+
+    unresolved_hosts = []
+    for failure in unresolved or []:
+        entry = dict(failure)
+        urls = host_urls.get(failure["host"], [])
+        if urls:
+            # Last: the only unbounded field in the entry.
+            entry["urls"] = {url: _url_evidence(None, url_sources.get(url),
+                                                url_unparsed.get(url))
+                             for url in urls}
+        unresolved_hosts.append(entry)
+
+    # `source_errors` sits next to the array it annotates: the origins whose
+    # payload never parsed, mapped to the decode failure. Omitted when every
+    # source parsed, which is the usual case.
+    output: dict = {"sources": entries}
+    if source_errors:
+        output["source_errors"] = source_errors
+    output["suspect_urls"] = suspect_urls
 
     if unresolved is not None:
         output["services"] = services_section
-        output["unresolved_hosts"] = unresolved
+        output["unresolved_hosts"] = unresolved_hosts
 
     with open(path, "w", encoding="utf-8") as f:
         json.dump(output, f, indent=2, ensure_ascii=False)
