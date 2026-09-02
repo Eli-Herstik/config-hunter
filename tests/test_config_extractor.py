@@ -596,14 +596,17 @@ async def test_output_file_writing(test_server, tmp_path):
         data = json.load(f)
 
     assert isinstance(data, dict)
-    assert "sources" in data
     assert "suspect_urls" in data
     assert isinstance(data["suspect_urls"], list)
-    assert len(data["sources"]) > 0
-    for entry in data["sources"]:
-        assert "source" in entry
-        assert "urls" in entry
-        assert isinstance(entry["urls"], list)
+    # The report indexes by URL, never by source: there is no forward array of
+    # sources to walk, only the provenance hanging off each URL.
+    assert "sources" not in data
+    assert len(data["services"]) > 0
+    for svc, entry in data["services"].items():
+        assert isinstance(entry["urls"], dict)
+        for url, evidence in entry["urls"].items():
+            assert _service_key(url) == svc
+            assert isinstance(evidence.get("sources", []), list)
 
 
 def test_write_results_quarantines_suspect_urls(tmp_path):
@@ -620,7 +623,10 @@ def test_write_results_quarantines_suspect_urls(tmp_path):
     with open(out, "r", encoding="utf-8") as f:
         data = json.load(f)
 
-    assert data["sources"][0]["urls"] == ["https://real.example.com/api"]
+    # The clean URL survives into the services map — the only place URLs are
+    # reported — carrying the origin it was extracted from.
+    assert data["services"]["https://real.example.com"]["urls"] == {
+        "https://real.example.com/api": {"sources": ["js: https://test/bundle.js"]}}
     assert {s["url"] for s in data["suspect_urls"]} == {
         "https://${env}/x", "https://www.%/y",
     }
@@ -711,9 +717,16 @@ def test_write_results_services_map_collapses_and_filters(tmp_path):
     assert down["unreachable"] == 1
 
 
-def test_write_results_omits_services_map_without_resolution(tmp_path):
-    """No DNS-resolution pass (unresolved is None) -> no `services` map, since
-    'passed DNS resolution' is undefined."""
+def test_write_results_services_map_survives_without_resolution(tmp_path):
+    """No DNS-resolution pass (unresolved is None) -> the `services` map is
+    still emitted, unfiltered.
+
+    It is the only place a clean URL is reported, so gating it on the probe
+    passes would drop the extraction itself whenever they didn't run. What the
+    map must not do is claim a DNS result nobody obtained: `ips` is omitted
+    rather than emitted empty, the verdict is null, nothing was probed — and the
+    absent `unresolved_hosts` is what tells a reader the pass never ran, since an
+    empty array there would claim every host resolved."""
     sources = [ConfigSource(
         origin="js: https://app/bundle.js",
         urls_found=["https://svc.example.com/api"],
@@ -722,7 +735,14 @@ def test_write_results_omits_services_map_without_resolution(tmp_path):
     write_results(sources, str(out))
     with open(out, "r", encoding="utf-8") as f:
         data = json.load(f)
-    assert "services" not in data
+
+    svc = data["services"]["https://svc.example.com"]
+    assert svc["urls"] == {
+        "https://svc.example.com/api": {"sources": ["js: https://app/bundle.js"]}}
+    assert "ips" not in svc
+    assert svc["auth_verdict"] is None
+    assert svc["urls_probed"] == 0
+    assert "unresolved_hosts" not in data
 
 
 def test_write_results_keys_services_by_origin(tmp_path):
@@ -873,11 +893,11 @@ def test_write_results_services_urls_flag_synthesized_roots(tmp_path):
 
 def test_write_results_urls_carry_their_sources(tmp_path):
     """Each service URL carries `sources`: the config origins that referenced
-    it — the top-level `sources` array inverted, so provenance is readable at
-    the point the exposure decision is made instead of by searching that array
-    backwards. Plural and in discovery order, since one URL is routinely
-    compiled into several bundles; absent for a root the scanner synthesized,
-    which no config ever named."""
+    it. The report keeps only this inversion of the extraction — provenance
+    reads forward from the URL under review, the direction the exposure decision
+    is actually made in. Plural and in discovery order, since one URL is
+    routinely compiled into several bundles; absent for a root the scanner
+    synthesized, which no config ever named."""
     sources = [
         ConfigSource(
             origin="js: https://app/vendor.js",
@@ -983,11 +1003,14 @@ def test_write_results_unresolved_hosts_carry_their_urls(tmp_path):
     # A host no clean URL named omits `urls` rather than emitting it empty.
     assert "urls" not in failures["never-referenced.corp"]
 
-    # Between them, the two sections account for every clean URL: nothing the
-    # configs referenced is reachable only through the top-level `sources` array.
+    # Between them, the two sections account for every clean URL the configs
+    # referenced. This is what lets the report index by URL alone: with no
+    # forward array of sources, a URL either of them dropped would be gone.
     placed = {u for e in data["unresolved_hosts"] for u in e.get("urls", {})}
     placed |= {u for svc in data["services"].values() for u in svc["urls"]}
-    assert placed >= {u for e in data["sources"] for u in e["urls"]}
+    extracted = {u for src in sources for u in src.urls_found
+                 if _classify_url(u) is None}
+    assert placed >= extracted
 
 
 def test_write_results_urls_flag_unparsed_sources(tmp_path):

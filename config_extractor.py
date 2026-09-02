@@ -1526,10 +1526,13 @@ def write_results(
     ip_map: dict[str, list[str]] | None = None,
 ) -> None:
     all_clean: set[str] = set()
-    # The `sources` list inverted: URL -> the origins that referenced it, which
-    # is how each service's per-URL evidence carries its provenance. Kept as a
-    # separate index rather than derived later because this loop is the only
-    # place the two are still associated.
+    # The `sources` argument inverted: URL -> the origins that referenced it,
+    # which is how each service's per-URL evidence carries its provenance. The
+    # report emits only this inversion, never the forward list: every URL a
+    # source contributed reaches the output through one of the two sections
+    # keyed by URL (`services` for a host that resolved, `unresolved_hosts` for
+    # one that didn't), so a source array alongside them would be the same facts
+    # a second time, read the wrong way round.
     url_sources: dict[str, list[str]] = {}
     # The same inversion narrowed to the sources that failed to parse (see
     # _url_evidence): URL -> the subset of its origins that were only
@@ -1538,14 +1541,8 @@ def write_results(
     url_unparsed: dict[str, list[str]] = {}
     source_errors: dict[str, str] = {}
     suspect_index: dict[str, dict] = {}
-    entries = []
     for src in sources:
         clean, suspect = _partition_urls(src.urls_found)
-        entries.append({
-            "source": src.origin,
-            "urls": clean,
-            "error": src.error,
-        })
         if src.error is not None:
             source_errors[src.origin] = src.error
         all_clean.update(clean)
@@ -1593,9 +1590,9 @@ def write_results(
     # transport. It is the union of the clean URLs the configs referenced and any
     # host root probed on our own initiative, the latter flagged `synthesized` so
     # the output never implies the app referenced `/` when it didn't. Each URL
-    # also carries its `sources` — the config origins that referenced it, the
-    # top-level `sources` array inverted — so the provenance is readable at the
-    # point of decision instead of by hand-searching that array backwards.
+    # also carries its `sources` — the config origins that referenced it — so
+    # provenance reads forward from the URL under review, which is the only
+    # direction anyone needs it in.
     unresolved_set = {e["host"] for e in unresolved} if unresolved else set()
     resolved_services = {s for s in services
                          if urlparse(s).hostname not in unresolved_set}
@@ -1616,7 +1613,10 @@ def write_results(
                          if p and p.detected_method is not None}
         hostname = urlparse(svc).hostname
         services_section[svc] = {
-            "ips": (ip_map or {}).get(hostname, []),
+            # Omitted rather than empty when no resolution pass ran: `[]` would
+            # read as "resolved to no addresses". A pass that did run always
+            # fills it, a service having reached this map only by resolving.
+            **({"ips": ip_map.get(hostname, [])} if ip_map is not None else {}),
             "auth_verdict": _collapse_host_verdict(auth_verdicts),
             "mixed": len(auth_verdicts) > 1,
             "urls_probed": len(probes),
@@ -1661,16 +1661,24 @@ def write_results(
                              for url in urls}
         unresolved_hosts.append(entry)
 
-    # `source_errors` sits next to the array it annotates: the origins whose
-    # payload never parsed, mapped to the decode failure. Omitted when every
-    # source parsed, which is the usual case.
-    output: dict = {"sources": entries}
+    # `source_errors` is the report's only index by origin: the sources whose
+    # payload never parsed, mapped to the decode failure. It holds the message
+    # once; which URLs are affected is on those URLs, as `unparsed_sources`.
+    # Omitted when every source parsed, which is the usual case.
+    output: dict = {}
     if source_errors:
         output["source_errors"] = source_errors
     output["suspect_urls"] = suspect_urls
-
+    # `services` is emitted unconditionally: it is the only place a clean URL on
+    # a resolvable host is reported, so gating it on the probe passes would drop the
+    # extraction itself whenever they didn't. Without them a service is honestly
+    # empty-handed — no `ips`, a null verdict, `urls_probed` 0 — and its URLs
+    # read as what they are, discovered and never probed. `unresolved_hosts`
+    # stays gated, because there the absence is the message: an empty array
+    # would claim every host resolved, and only a pass that actually ran can say
+    # that.
+    output["services"] = services_section
     if unresolved is not None:
-        output["services"] = services_section
         output["unresolved_hosts"] = unresolved_hosts
 
     with open(path, "w", encoding="utf-8") as f:
