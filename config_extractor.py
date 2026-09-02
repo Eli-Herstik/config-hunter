@@ -149,10 +149,6 @@ class ProbeResult:
     # being a question. Often relative ("/login"); resolve against `url` for the
     # absolute target.
     location: str | None = None
-    # The verdict this URL's *own* origin's root answered, so a gated path that 
-    # named no scheme still points at the front door that explains it.
-    # UNAUTHENTICATED means that front door is open.
-    root_discloses: AuthMethod | None = None
     error: str | None = None
 
 
@@ -273,9 +269,8 @@ def _service_key(url: str) -> str | None:
     https://h:443 (and http://h / http://h:80) name one service, not two.
     Returns None if the URL has no host.
 
-    Used both to roll auth verdicts up in the report and to scope the host-root
-    disclosure in probe_urls_with_roots — the two places one origin's evidence
-    must not leak onto another's."""
+    Used to roll auth verdicts up in the report, so one origin's evidence never
+    leaks onto another's."""
     parsed = urlparse(url)
     host = parsed.hostname
     if not host:
@@ -475,14 +470,11 @@ async def probe_urls_with_roots(
     """Probe `urls`, then for any host with a path we couldn't read (400/401/403,
     scheme not named) probe that host's root once to try to disclose the scheme.
 
-    The root probe fires on three statuses but they mean different things:
-    401/403 establish "this path is gated, scheme undisclosed" — so the root's
-    verdict is also recorded on the path as `root_discloses`, linking it to the
-    front door that explains it. A 400 ("rejected before auth could be
-    evaluated" — WAF, wrong verb/content-type, SNI) establishes no such thing
-    about the path, so it triggers the root probe (the host is alive and its
-    front door is a useful fact) but is never annotated — "the root discloses X"
-    on a malformed-request path would be an unfounded inference.
+    The probe fires on 401/403 ("this path is gated, scheme undisclosed") and on
+    400 ("rejected before auth could be evaluated" — WAF, wrong verb/content-type,
+    SNI). Those mean different things about the path, but neither is read back
+    onto it: the root's verdict is reported as the root's own entry and nothing
+    else, leaving what it implies about a sibling path to the reader.
 
     Returns (path_probes, root_probes). root_probes are for synthesized
     host-root URLs not already in `urls`, filtered to those that disclosed
@@ -495,9 +487,6 @@ async def probe_urls_with_roots(
 
     def triggers_root(p: ProbeResult) -> bool:
         return p.status_code in (400, 401, 403) and p.detected_method is AuthMethod.UNKNOWN
-
-    def gets_root_disclosure(p: ProbeResult) -> bool:
-        return p.status_code in (401, 403) and p.detected_method is AuthMethod.UNKNOWN
 
     probed = set(urls)
     roots: list[str] = []
@@ -515,26 +504,6 @@ async def probe_urls_with_roots(
         root_probes = [r for r in raw
                        if r.detected_method is not None
                        and r.detected_method is not AuthMethod.UNKNOWN]
-
-    # Point each undisclosed *gated* path (401/403) at the front door that
-    # explains it, since once the root is a separate entry nothing else links
-    # them in the per-URL view. 400 paths trigger the probe but are not annotated.
-    #
-    # Matched by _service_key (origin), not by hostname: the root we probed is
-    # already origin-scoped (_host_root_url keeps scheme and port), so matching on
-    # the bare hostname would let one origin's front door explain a path on a
-    # different port or scheme of the same box — the cross-origin merge the report
-    # is careful to avoid. Two ports on one host are two services with their own
-    # auth; `root_discloses: ntlm` on the wrong one is a fabricated finding.
-    disclosed: dict[str, AuthMethod] = {}
-    for r in root_probes:
-        svc = _service_key(r.url)
-        if svc:
-            disclosed[svc] = r.detected_method
-    for p in path_probes:
-        if gets_root_disclosure(p):
-            svc = _service_key(p.url)
-            p.root_discloses = disclosed.get(svc) if svc else None
     return path_probes, root_probes
 
 
@@ -1464,7 +1433,7 @@ def _url_evidence(info: "AuthInfo | None",
     """Render one URL's probe evidence as emitted under a service's `urls`.
 
     Null fields are omitted rather than serialized: most probes set two or three
-    of the six, and spelling out the nulls cost more bytes than the evidence.
+    of the five, and spelling out the nulls cost more bytes than the evidence.
     An entry with no probe fields is therefore a real answer — "discovered,
     never probed" — not a missing one; for a config-referenced URL that leaves
     just its `sources`. `synthesized` marks a host root the scanner probed on its own
@@ -1507,8 +1476,6 @@ def _url_evidence(info: "AuthInfo | None",
             entry["location"] = p.location
         if p.detected_method is not None:
             entry["detected_method"] = p.detected_method
-        if p.root_discloses is not None:
-            entry["root_discloses"] = p.root_discloses
         if p.error is not None:
             entry["error"] = p.error
     if sources:

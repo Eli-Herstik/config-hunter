@@ -637,12 +637,12 @@ def test_write_results_quarantines_suspect_urls(tmp_path):
         assert s["sources"] == ["js: https://test/bundle.js"]
 
 
-def _auth_info(url, method, *, status=200, root_discloses=None, error=None):
+def _auth_info(url, method, *, status=200, error=None):
     return AuthInfo(
         url=url,
         probe_result=ProbeResult(
             url=url, status_code=status, www_authenticate=None,
-            detected_method=method, root_discloses=root_discloses, error=error,
+            detected_method=method, error=error,
         ),
     )
 
@@ -857,8 +857,7 @@ def test_write_results_services_urls_flag_synthesized_roots(tmp_path):
     )]
     auth_map = {
         "https://svc.example.com/api": _auth_info(
-            "https://svc.example.com/api", AuthMethod.UNKNOWN, status=401,
-            root_discloses=AuthMethod.NTLM),
+            "https://svc.example.com/api", AuthMethod.UNKNOWN, status=401),
         "https://svc.example.com/": AuthInfo(
             url="https://svc.example.com/",
             probe_result=ProbeResult(
@@ -882,12 +881,13 @@ def test_write_results_services_urls_flag_synthesized_roots(tmp_path):
         "synthesized": True, "status_code": 401,
         "www_authenticate": "NTLM", "detected_method": "ntlm",
     }
-    # The referenced path keeps its own weaker verdict, unflagged — but carries
-    # `root_discloses`, the only thing tying it to the root entry above, which
-    # is a separate URL with no other link back to this one.
+    # The referenced path keeps its own weaker verdict, unflagged. Nothing on it
+    # points at the root: the two are related only by sharing this service entry.
     assert "synthesized" not in svc["urls"]["https://svc.example.com/api"]
-    assert svc["urls"]["https://svc.example.com/api"]["detected_method"] == "unknown"
-    assert svc["urls"]["https://svc.example.com/api"]["root_discloses"] == "ntlm"
+    assert svc["urls"]["https://svc.example.com/api"] == {
+        "status_code": 401, "detected_method": "unknown",
+        "sources": ["js: https://app/bundle.js"],
+    }
     assert "auth" not in data
 
 
@@ -1457,7 +1457,7 @@ def _create_auth_app(gated_root: bool = False):
 
     gated_root makes `/` answer a Basic challenge instead of serving the index,
     so a second instance on another port is a *distinguishable* service sharing
-    one hostname — what the cross-origin root-disclosure test needs."""
+    one hostname — what the cross-origin root-probe test needs."""
     app = web.Application()
 
     async def handle_index(request):
@@ -1731,20 +1731,15 @@ async def test_probe_forbidden_keeps_verdict_and_probes_root(auth_server):
     assert root_probes[0].url == f"{auth_server}/"
     assert root_probes[0].status_code == 200
     assert root_probes[0].detected_method == "unauthenticated"
-    # ...and the path is annotated with that root's verdict, the only thing
-    # linking the locked path to the open front door once the root is its own
-    # entry. UNAUTHENTICATED is how "front door open" is spelled.
-    assert path_probes[0].root_discloses == AuthMethod.UNAUTHENTICATED
 
 
 @pytest.mark.asyncio
-async def test_root_disclosure_does_not_cross_origins(auth_server, gated_auth_server):
-    """Two ports on one hostname are two services, each with its own front door.
-    A gated path must be annotated from *its own* origin's root. Matching the
-    roots by bare hostname let whichever root was probed last explain every
-    gated path on the box — reporting an auth scheme for a service that was never
-    probed that way, which is exactly the cross-origin merge _service_key exists
-    to prevent in the report."""
+async def test_root_probe_does_not_cross_origins(auth_server, gated_auth_server):
+    """Two ports on one hostname are two services, each with its own front door,
+    and each must be probed. Deduplicating the roots by bare hostname would probe
+    whichever came first and let it stand for the whole box — reporting a front
+    door for a service that was never probed that way, the cross-origin merge
+    _service_key exists to prevent in the report."""
     open_root = f"{auth_server}/auth/forbidden"          # this origin's / is 200
     gated_root = f"{gated_auth_server}/auth/forbidden"   # this origin's / is 401 Basic
 
@@ -1755,13 +1750,14 @@ async def test_root_disclosure_does_not_cross_origins(auth_server, gated_auth_se
     path_probes, root_probes = await probe_urls_with_roots(
         [open_root, gated_root], timeout=5.0)
 
-    # Both front doors were probed, as two separate services.
-    assert {r.url for r in root_probes} == {f"{auth_server}/", f"{gated_auth_server}/"}
-
-    # Each gated path carries its own origin's root verdict, not its neighbour's.
-    disclosed = {p.url: p.root_discloses for p in path_probes}
-    assert disclosed[open_root] == AuthMethod.UNAUTHENTICATED
-    assert disclosed[gated_root] == AuthMethod.BASIC
+    # Both front doors were probed, as two separate services, each keeping its
+    # own verdict rather than one standing in for the other.
+    assert {r.url: r.detected_method for r in root_probes} == {
+        f"{auth_server}/": AuthMethod.UNAUTHENTICATED,
+        f"{gated_auth_server}/": AuthMethod.BASIC,
+    }
+    # Neither path was rewritten from a root.
+    assert {p.detected_method for p in path_probes} == {AuthMethod.UNKNOWN}
 
 
 @pytest.mark.asyncio
@@ -1792,11 +1788,10 @@ async def test_probe_unreachable_url():
 
 
 @pytest.mark.asyncio
-async def test_probe_bad_request_probes_root_no_disclosure(auth_server):
+async def test_probe_bad_request_probes_root(auth_server):
     """400 (rejected before auth could be read) triggers a root probe so the
-    host's front door is still mapped — but is never annotated with the root's
-    verdict, since "the root discloses X" on a malformed-request path is an
-    unfounded inference. The path keeps its own verdict."""
+    host's front door is still mapped. The path keeps its own verdict — the
+    root's is reported separately, as its own result."""
     path_probes, root_probes = await probe_urls_with_roots(
         [f"{auth_server}/auth/bad-request"], timeout=5.0)
     assert path_probes[0].status_code == 400
@@ -1806,8 +1801,6 @@ async def test_probe_bad_request_probes_root_no_disclosure(auth_server):
     assert len(root_probes) == 1
     assert root_probes[0].url.endswith("/")
     assert root_probes[0].detected_method == "unauthenticated"
-    # but the 400 path is not annotated with that root's verdict
-    assert path_probes[0].root_discloses is None
 
 
 @pytest.mark.asyncio
@@ -1908,17 +1901,15 @@ class TestServiceKey:
 
 
 @pytest.mark.asyncio
-async def test_probe_subpath_400_probes_root_no_disclosure(auth_server):
+async def test_probe_subpath_400_probes_root(auth_server):
     """A 400 on a deep path triggers a probe of the host root (not the path's own
-    parent) so the front door is mapped; the path keeps its verdict and is not
-    annotated with the root's."""
+    parent) so the front door is mapped; the path keeps its own verdict."""
     path_probes, root_probes = await probe_urls_with_roots(
         [f"{auth_server}/api-gated/v1/data"], timeout=5.0)
     assert path_probes[0].status_code == 400
     assert path_probes[0].detected_method == "unknown"
     assert len(root_probes) == 1
-    assert root_probes[0].url.endswith("/")
-    assert path_probes[0].root_discloses is None
+    assert root_probes[0].url == f"{auth_server}/"
 
 
 @pytest.mark.asyncio
