@@ -1,6 +1,7 @@
 """Tests for config_extractor.py"""
 
 import asyncio
+import inspect
 import json
 import sys
 import os
@@ -47,7 +48,6 @@ from config_extractor import (
     _classify_probe,
     _cookies_from_kv,
     _headers_from_kv,
-    _storage_state_to_probe_cookies,
     _check_auth_signal,
 )
 
@@ -2061,34 +2061,6 @@ class TestHeadersFromKv:
         assert h == {"Ok": "yes"}
 
 
-class TestStorageStateToProbeCookies:
-    def test_extracts_matching_host(self, tmp_path):
-        path = tmp_path / "auth.json"
-        path.write_text(json.dumps({
-            "cookies": [
-                {"name": "session", "value": "abc", "domain": "127.0.0.1"},
-                {"name": "other", "value": "xyz", "domain": "other.example.com"},
-            ],
-            "origins": [],
-        }))
-        cookies = _storage_state_to_probe_cookies(str(path), "http://127.0.0.1:8080/")
-        assert cookies == {"session": "abc"}
-
-    def test_missing_file_returns_empty(self, tmp_path):
-        cookies = _storage_state_to_probe_cookies(str(tmp_path / "nope.json"),
-                                                  "https://app.example.com/")
-        assert cookies == {}
-
-    def test_dotted_domain_matches_subdomain(self, tmp_path):
-        path = tmp_path / "auth.json"
-        path.write_text(json.dumps({
-            "cookies": [{"name": "s", "value": "1", "domain": ".example.com"}],
-            "origins": [],
-        }))
-        cookies = _storage_state_to_probe_cookies(str(path), "https://app.example.com/")
-        assert cookies == {"s": "1"}
-
-
 class TestCheckAuthSignal:
     def test_clean_returns_none(self):
         assert _check_auth_signal("https://app.example.com/",
@@ -2162,25 +2134,34 @@ async def test_storage_state_roundtrip(test_server, tmp_path):
 
 
 @pytest.mark.asyncio
-async def test_probe_urls_with_cookie(test_server):
-    """probe_urls should send cookies and see 200 instead of 401."""
+async def test_probe_stays_anonymous_after_authenticated_crawl(test_server):
+    """The crawl's session must not follow the URLs it found into the probe.
+
+    The gated route is reachable with the cookie — the crawl test above proves
+    it — so a probe that inherited the session would read 200 and the verdict
+    would come back UNAUTHENTICATED. The probe takes no credentials at all, so
+    the endpoint reports what it actually demands of an anonymous caller."""
+    host = test_server.replace("http://", "").split(":")[0]
     url = f"{test_server}/protected/config.json"
 
-    no_cookie = await probe_urls([url], timeout=5.0)
-    assert no_cookie[0].status_code == 401
+    await crawl(
+        test_server,
+        timeout=10000,
+        wait_after_load=2000,
+        cookies=[{"name": "session", "value": "abc", "domain": host, "path": "/"}],
+    )
 
-    with_cookie = await probe_urls([url], timeout=5.0, cookies={"session": "abc"})
-    assert with_cookie[0].status_code == 200
+    results = await probe_urls([url], timeout=5.0)
+    assert results[0].status_code == 401
 
 
-@pytest.mark.asyncio
-async def test_probe_urls_with_extra_header(test_server):
-    """Extra headers passed to probe_urls should be merged with the User-Agent."""
-    # /config.json doesn't gate on headers, but we verify the call shape works.
-    url = f"{test_server}/config.json"
-    results = await probe_urls([url], timeout=5.0,
-                               headers={"X-Custom": "test"})
-    assert results[0].status_code == 200
+def test_probe_entry_points_take_no_credentials():
+    """A credential kwarg must not creep back onto the probe: aiohttp would put a
+    domainless cookie dict in the shared jar and session headers on every
+    request, so it would reach third-party hosts named in vendor bundles."""
+    for fn in (probe_urls, probe_urls_with_roots):
+        params = set(inspect.signature(fn).parameters)
+        assert not params & {"cookies", "headers", "storage_state", "auth"}
 
 
 # ===========================================================================

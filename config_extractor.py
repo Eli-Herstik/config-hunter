@@ -441,20 +441,20 @@ async def probe_urls(
     urls: list[str],
     timeout: float = 5.0,
     max_concurrent: int = 10,
-    cookies: dict[str, str] | None = None,
-    headers: dict[str, str] | None = None,
 ) -> list[ProbeResult]:
-    """Probe a list of URLs for authentication requirements."""
+    """Probe a list of URLs for authentication requirements.
+
+    The probe is deliberately anonymous. Sending a session would invert the answer. 
+    The probe classifies what anendpoint *demands*, so an authenticated request 
+    turns a gated URL into a 200 and the verdict into UNAUTHENTICATED — backwards 
+    exactly where it costs most, since "open" is the finding that decides whether 
+    the F5 may expose it."""
     unique_urls = list(dict.fromkeys(urls))  # deduplicate, preserve order
     semaphore = asyncio.Semaphore(max_concurrent)
-    merged_headers = {"User-Agent": "ConfigExtractor/1.0", **(headers or {})}
-    session_kwargs: dict = {
-        "headers": merged_headers,
-        "connector": aiohttp.TCPConnector(ssl=_probe_ssl_context()),
-    }
-    if cookies:
-        session_kwargs["cookies"] = cookies
-    async with aiohttp.ClientSession(**session_kwargs) as session:
+    async with aiohttp.ClientSession(
+        headers={"User-Agent": "ConfigExtractor/1.0"},
+        connector=aiohttp.TCPConnector(ssl=_probe_ssl_context()),
+    ) as session:
         tasks = [_probe_single(session, url, semaphore, timeout) for url in unique_urls]
         return await asyncio.gather(*tasks)
 
@@ -464,8 +464,6 @@ async def probe_urls_with_roots(
     *,
     timeout: float = 5.0,
     max_concurrent: int = 10,
-    cookies: dict[str, str] | None = None,
-    headers: dict[str, str] | None = None,
 ) -> tuple[list[ProbeResult], list[ProbeResult]]:
     """Probe `urls`, then for any host with a path we couldn't read (400/401/403,
     scheme not named) probe that host's root once to try to disclose the scheme.
@@ -481,8 +479,7 @@ async def probe_urls_with_roots(
     something useful (a concrete scheme, or UNAUTHENTICATED = 'front door
     open'); UNKNOWN or errored roots add nothing and are dropped. The path keeps its own
     verdict — the root is never substituted into it."""
-    kw = dict(timeout=timeout, max_concurrent=max_concurrent,
-              cookies=cookies, headers=headers)
+    kw = dict(timeout=timeout, max_concurrent=max_concurrent)
     path_probes = await probe_urls(urls, **kw)
 
     def triggers_root(p: ProbeResult) -> bool:
@@ -1231,27 +1228,6 @@ def _headers_from_kv(items: list[str]) -> dict[str, str]:
     return headers
 
 
-def _storage_state_to_probe_cookies(path: str, seed_url: str) -> dict[str, str]:
-    """Read a Playwright storage-state JSON and extract cookies for the seed host
-    as a flat {name: value} dict suitable for aiohttp.ClientSession(cookies=...)."""
-    host = urlparse(seed_url).hostname or ""
-    try:
-        with open(path, "r", encoding="utf-8") as f:
-            data = json.load(f)
-    except (OSError, json.JSONDecodeError) as e:
-        print(f"  [warn] Could not read storage-state {path}: {e}", file=sys.stderr)
-        return {}
-    out: dict[str, str] = {}
-    for c in data.get("cookies", []):
-        cookie_domain = (c.get("domain") or "").lstrip(".")
-        if not cookie_domain or host == cookie_domain or host.endswith("." + cookie_domain):
-            name = c.get("name")
-            value = c.get("value")
-            if name is not None and value is not None:
-                out[name] = value
-    return out
-
-
 def _check_auth_signal(seed_url: str, final_url: str, status: int | None,
                       www_authenticate: str | None) -> str | None:
     """Return a warning string if the seed page looks unauthenticated, else None."""
@@ -1694,11 +1670,11 @@ def main() -> None:
     )
     parser.add_argument(
         "--cookie", action="append", default=[],
-        help="Set a cookie KEY=VAL (repeatable). Domain inferred from URL.",
+        help="Set a cookie KEY=VAL on the crawl(repeatable). Domain inferred from URL.",
     )
     parser.add_argument(
         "--header", action="append", default=[],
-        help='Send an extra HTTP header "Name: Value" (repeatable).',
+        help='Send an extra HTTP header "Name: Value" on the crawl (repeatable).',
     )
     parser.add_argument(
         "--follow-links", action="store_true",
@@ -1747,12 +1723,6 @@ def main() -> None:
         all_urls.extend(src.urls_found)
     unique_urls = [u for u in dict.fromkeys(all_urls) if _classify_url(u) is None]
 
-    probe_cookies: dict[str, str] = {}
-    if args.storage_state:
-        probe_cookies.update(_storage_state_to_probe_cookies(args.storage_state, args.url))
-    for c in cli_cookies:
-        probe_cookies[c["name"]] = c["value"]
-
     unresolved: list[dict] = []
     ip_map: dict[str, list[str]] = {}
     probeable_urls = unique_urls
@@ -1774,8 +1744,6 @@ def main() -> None:
             probeable_urls,
             timeout=float(args.probe_timeout),
             max_concurrent=args.probe_concurrency,
-            cookies=probe_cookies or None,
-            headers=cli_headers or None,
         ))
         auth_map = build_auth_map(path_probes, root_probes)
         if root_probes:

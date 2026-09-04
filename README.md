@@ -9,7 +9,7 @@ A Playwright-based crawler that loads a web app, captures the JSON configs and J
 3. **DOM scan** — Reads `<script type="application/json">` blocks, inline global assignments (`window.__CONFIG = {…}`), and referenced `*.json` assets.
 4. **Manifest probe** — Tries well-known build manifest paths (`/asset-manifest.json`, `/manifest.json`, `/.vite/manifest.json`, …) and pulls referenced chunks as text.
 5. **Extract** — Recursively walks parsed JSON and falls back to a regex over raw text. JS-object syntax (single quotes, trailing commas, comments) is sanitized before parsing.
-6. **Probe** — Issues a `HEAD` (with `GET` fallback on 405) to each discovered URL and classifies the response by status code and `WWW-Authenticate` header. A response may offer several schemes at once — IIS answers `Negotiate` and `NTLM`, either on repeated header lines or comma-separated in one. An offer is the client's to choose from, so the verdict is the best scheme available rather than the first one listed, and the full offer is kept as evidence. Note this runs opposite to the roll-up across a service's URLs below: a URL offering both `Bearer` and `Basic` is exposable on Bearer, while a service with one Bearer-only URL and one NTLM-only URL is not, since exposing it means exposing both. On 403/401 it retries against the host root, since the specific path may block unauthenticated requests while the root reveals the real auth challenge.
+6. **Probe** — Issues a `HEAD` (with `GET` fallback on 405) to each discovered URL and classifies the response by status code and `WWW-Authenticate` header. A response may offer several schemes at once — IIS answers `Negotiate` and `NTLM`, either on repeated header lines or comma-separated in one. An offer is the client's to choose from, so the verdict is the best scheme available rather than the first one listed, and the full offer is kept as evidence. Note this runs opposite to the roll-up across a service's URLs below: a URL offering both `Bearer` and `Basic` is exposable on Bearer, while a service with one Bearer-only URL and one NTLM-only URL is not, since exposing it means exposing both. On 403/401 it retries against the host root, since the specific path may block unauthenticated requests while the root reveals the real auth challenge. The probe always runs anonymous, even when the crawl that found these URLs was authenticated — see below.
 
 ## Install
 
@@ -49,6 +49,18 @@ python config_extractor.py https://app.example.com \
     --header "Authorization: Bearer eyJ…"
 ```
 
+All three reach the **crawl only**. The auth probe never sends them, which is
+deliberate rather than an omission:
+
+- **It would invert the verdict.** The probe's job is to record what an endpoint
+  *demands*. Authenticate it and a gated URL answers 200 and collapses to
+  `unauthenticated` — backwards exactly where it costs the most, since an open
+  endpoint is the finding that decides whether the F5 may expose the service.
+
+So the session is how you *find* the URLs, not how you *judge* them. A URL only
+the authenticated crawl could discover still gets probed cold, and reports the
+scheme it puts in front of an anonymous caller.
+
 ### Crawling more pages
 
 ```sh
@@ -70,9 +82,9 @@ A time-budgeted pass of safe scrolls, hovers, and clicks runs on every page to s
 | `--max-pages N` | Cap pages visited (default 1) |
 | `--interact-budget MS` | Per-page interaction budget (default 8000) |
 | `--probe-timeout S` / `--probe-concurrency N` | Tune the auth-probe pass |
-| `--storage-state PATH` | Reuse a saved Playwright session (`playwright codegen --save-storage=…`) |
-| `--cookie KEY=VAL` | Set a cookie (repeatable) |
-| `--header "Name: Value"` | Set an extra header (repeatable) |
+| `--storage-state PATH` | Reuse a saved Playwright session, crawl only (`playwright codegen --save-storage=…`) |
+| `--cookie KEY=VAL` | Set a cookie on the crawl (repeatable) |
+| `--header "Name: Value"` | Set an extra header on the crawl (repeatable) |
 
 ## Output
 
