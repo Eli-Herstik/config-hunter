@@ -27,8 +27,6 @@ MAX_PAYLOAD_BYTES = 5 * 1024 * 1024  # 5 MB
 @dataclass
 class ConfigSource:
     origin: str
-    raw_text: str = ""
-    json_payload: object = None
     urls_found: list[str] = field(default_factory=list)
     error: str | None = None
 
@@ -810,8 +808,6 @@ def process_network_captures(captured: list[tuple[str, str]]) -> list[ConfigSour
         if urls:
             sources.append(ConfigSource(
                 origin=f"network: {url}",
-                raw_text=body[:200],
-                json_payload=parsed,
                 urls_found=urls,
                 error=err,
             ))
@@ -829,8 +825,6 @@ def process_js_captures(captured: list[tuple[str, str]]) -> list[ConfigSource]:
         if urls:
             sources.append(ConfigSource(
                 origin=f"js: {url}",
-                raw_text=body[:200],
-                json_payload=None,
                 urls_found=urls,
                 error=None,
             ))
@@ -863,8 +857,6 @@ async def extract_from_dom(page: Page, captured_urls: set[str]) -> list[ConfigSo
         if urls:
             sources.append(ConfigSource(
                 origin="dom: <script type=\"application/json\">",
-                raw_text=text[:200],
-                json_payload=parsed,
                 urls_found=urls,
                 error=err,
             ))
@@ -890,8 +882,6 @@ async def extract_from_dom(page: Page, captured_urls: set[str]) -> list[ConfigSo
                 assign_label = assign_text.split("=")[0].strip()[-40:]
                 sources.append(ConfigSource(
                     origin=f"dom: inline script ({assign_label})",
-                    raw_text=json_str[:200],
-                    json_payload=parsed,
                     urls_found=urls,
                     error=err,
                 ))
@@ -917,8 +907,6 @@ async def extract_from_dom(page: Page, captured_urls: set[str]) -> list[ConfigSo
             if urls:
                 sources.append(ConfigSource(
                     origin=f"dom: referenced file {src}",
-                    raw_text=body[:200],
-                    json_payload=parsed,
                     urls_found=urls,
                     error=err,
                 ))
